@@ -329,7 +329,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 <script type="text/babel" data-presets="react">
 const { useState, useRef } = React;
 
-const APP_VERSION="v3";
+const APP_VERSION="v6";
 
 const W = {
   pageBg:"#F5F0E8",sidebarBg:"#EAE3D6",sidebarAct:"#DDD4C2",
@@ -367,6 +367,8 @@ const ALT_DEGS=["—","incipiente (<10%)","leve (10–25%)","moderada (25–50%)
 const TECHNIQUES=["PPL / XPL","Conoscopia","Platina universal","Catodoluminiscencia","SEM-EDX","DRX","Análisis de imagen","Microsonda electrónica"];
 const RAMSAY=["—","Isótropo","I","II","III","IV+"];
 const OBJ_MAGS=["—","2.5×","4×","5×","10×","20×","40×","50×","100× (inmersión)"];
+const SPOT_TYPES=["Mineral","Contacto","Venilla","Textura","Otro"];
+const SPOT_COLORS={Mineral:"#7A5C2E",Contacto:"#4A6B8A",Venilla:"#7A3A1A",Textura:"#5C6B3A",Otro:"#6B5A45"};
 const SCALE_UNITS=["μm","mm"];
 const UTM_ZONES=["17S","18S","19S","20S","21S","17H","18H","19H","20H"];
 const ROCK_TYPES=["volcánica","intrusiva","sedimentaria","metamórfica"];
@@ -528,6 +530,9 @@ const mkS=n=>({
         objMag:"—",scaleBar:"",scaleUnit:"μm"},
   ppl:null,xpl:null,
   pointCount:{active:false,view:null,targetN:300,cols:0,rows:0,points:[],cursor:-1,editIdx:null},
+  spots:[],spotsView:null,spotAdding:false,spotEditId:null,
+  calib:null,calibDraft:null,
+  sam:{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null},
   techniques:["PPL / XPL"],
   texture:"",structure:"",rockName:"",classification:"",desc:"",minerals:[],ai:"",aiParsed:null,
   colorIndex:"",phenocrystPct:"",qapf:{q:"",a:"",p:"",f:""},
@@ -567,6 +572,65 @@ const genGrid=(w,h,targetN)=>{
   const points=[];
   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++)points.push({id:r*cols+c,row:r,col:c,x:(c+0.5)/cols,y:(r+0.5)/rows,mineral:""});
   return{cols,rows,points};
+};
+
+// ── Detección de grano por IA (SlimSAM vía transformers.js, en el navegador) ──
+// Modelo/tensores no van en el estado de React (no son serializables) — viven en este cache de módulo.
+const SAM_MODEL_ID="Xenova/slimsam-77-uniform";
+const SAM_CDN="https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3";
+let SAM=null; // {mod,model,processor,device}
+let SAM_IMG=null; // {key,processed,embeddings}
+const loadSamModel=async()=>{
+  if(SAM)return SAM;
+  const mod=await import(/* webpackIgnore: true */ SAM_CDN);
+  const{SamModel,AutoProcessor}=mod;
+  const hasWebgpu=typeof navigator!=="undefined"&&!!navigator.gpu;
+  try{
+    if(!hasWebgpu)throw new Error("sin WebGPU");
+    const model=await SamModel.from_pretrained(SAM_MODEL_ID,{dtype:"fp16",device:"webgpu"});
+    const processor=await AutoProcessor.from_pretrained(SAM_MODEL_ID);
+    SAM={mod,model,processor,device:"webgpu"};
+  }catch(e){
+    const model=await SamModel.from_pretrained(SAM_MODEL_ID,{dtype:"q8",device:"wasm"});
+    const processor=await AutoProcessor.from_pretrained(SAM_MODEL_ID);
+    SAM={mod,model,processor,device:"wasm"};
+  }
+  return SAM;
+};
+const encodeSamImage=async(view,img)=>{
+  const key=`${view}:${img.url.length}:${img.w}x${img.h}`;
+  if(SAM_IMG&&SAM_IMG.key===key)return SAM_IMG;
+  const{RawImage}=SAM.mod;
+  const raw=await RawImage.fromURL(img.url);
+  const processed=await SAM.processor(raw);
+  const embeddings=await SAM.model.get_image_embeddings(processed);
+  SAM_IMG={key,processed,embeddings};
+  return SAM_IMG;
+};
+// Devuelve {maskUrl,areaPx,score} — maskUrl es un PNG (data URL) del tamaño de la imagen, con la máscara pintada semitransparente.
+// Forma de tensores e indexado de máscara verificados contra el demo oficial (huggingface.co/spaces/Xenova/segment-anything-webgpu).
+const runSamDecode=async(x,y,img)=>{
+  const{Tensor,RawImage}=SAM.mod;
+  const{processed,embeddings}=SAM_IMG;
+  const reshaped=processed.reshaped_input_sizes[0]; // [h,w] del tensor de entrada
+  const input_points=new Tensor("float32",[x*reshaped[1],y*reshaped[0]],[1,1,1,2]);
+  const input_labels=new Tensor("int64",[1n],[1,1,1]);
+  const{pred_masks,iou_scores}=await SAM.model({...embeddings,input_points,input_labels});
+  const masks=await SAM.processor.post_process_masks(pred_masks,processed.original_sizes,processed.reshaped_input_sizes);
+  const mask=RawImage.fromTensor(masks[0][0]); // 3 canales (una máscara candidata por canal), binaria 0/1
+  const scores=iou_scores.data;
+  let best=0;for(let i=1;i<scores.length;i++)if(scores[i]>scores[best])best=i;
+  const numMasks=scores.length;
+  const w=mask.width,h=mask.height,data=mask.data;
+  const cv=document.createElement("canvas");cv.width=w;cv.height=h;
+  const ctx=cv.getContext("2d");
+  const imgData=ctx.createImageData(w,h);
+  let areaPx=0;
+  for(let p=0;p<w*h;p++){
+    if(data[numMasks*p+best]===1){areaPx++;imgData.data[p*4]=196;imgData.data[p*4+1]=154;imgData.data[p*4+2]=82;imgData.data[p*4+3]=140;}
+  }
+  ctx.putImageData(imgData,0,0);
+  return{maskUrl:cv.toDataURL("image/png"),areaPx,score:scores[best]};
 };
 
 // ── Glosario: contexto + botón "?" ────────────────────────────────────
@@ -669,9 +733,102 @@ function ImgZone({img,label,onFile,onClear}){
   );
 }
 
+// ── Calibración de escala (px → unidad real) ───────────────────────────
+function CalibPanel({calib,draft,ppl,xpl,onStart,onCancel,onImgClick,onLen,onUnit,onSave,onClear}){
+  if(!ppl&&!xpl)return null;
+  if(!draft){
+    return(
+      <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14,display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em",flex:"1 1 auto"}}><i className="ti ti-ruler-2" style={{marginRight:5}}/>Calibración de escala{calib?` — ${calib.view==="xpl"?"XPL":"PPL"}`:""}</p>
+        {calib?(
+          <>
+            <span style={{fontSize:12,color:W.textSec}}>{calib.pxPerUnit.toFixed(2)} px / {calib.unit}</span>
+            {ppl&&<button className="wbtn" style={{fontSize:11}} onClick={()=>onStart("ppl")}><i className="ti ti-refresh"/> Recalibrar en PPL</button>}
+            {xpl&&<button className="wbtn" style={{fontSize:11}} onClick={()=>onStart("xpl")}><i className="ti ti-refresh"/> Recalibrar en XPL</button>}
+            <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onClear}><i className="ti ti-x"/> Quitar</button>
+          </>
+        ):(
+          <>
+            {ppl&&<button className="wbtn" style={{fontSize:11}} onClick={()=>onStart("ppl")}><i className="ti ti-ruler-2"/> Calibrar en PPL</button>}
+            {xpl&&<button className="wbtn" style={{fontSize:11}} onClick={()=>onStart("xpl")}><i className="ti ti-ruler-2"/> Calibrar en XPL</button>}
+          </>
+        )}
+      </div>
+    );
+  }
+  const img=draft.view==="xpl"?xpl:ppl;
+  const step=draft.x1==null?1:draft.x2==null?2:3;
+  const pxDist=step===3?Math.hypot((draft.x2-draft.x1)*img.w,(draft.y2-draft.y1)*img.h):null;
+  return(
+    <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-ruler-2" style={{marginRight:5}}/>
+          {step===1&&"Clic en el primer extremo de la barra de escala"}
+          {step===2&&"Clic en el segundo extremo"}
+          {step===3&&"Distancia real entre los dos puntos"}
+        </p>
+        <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onCancel}><i className="ti ti-x"/> Cancelar</button>
+      </div>
+      <div style={{position:"relative",maxWidth:520,lineHeight:0,cursor:"crosshair"}}
+        onClick={e=>{const r=e.currentTarget.getBoundingClientRect();onImgClick((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height);}}>
+        <img src={img.url} alt="" style={{width:"100%",display:"block",borderRadius:8}}/>
+        {draft.x1!=null&&<div style={{position:"absolute",left:`${draft.x1*100}%`,top:`${draft.y1*100}%`,width:12,height:12,marginLeft:-6,marginTop:-6,borderRadius:"50%",background:W.accentBt,border:"2px solid #fff"}}/>}
+        {draft.x2!=null&&<div style={{position:"absolute",left:`${draft.x2*100}%`,top:`${draft.y2*100}%`,width:12,height:12,marginLeft:-6,marginTop:-6,borderRadius:"50%",background:W.accentBt,border:"2px solid #fff"}}/>}
+      </div>
+      {step===3&&(
+        <div style={{display:"flex",gap:10,alignItems:"center",marginTop:12,flexWrap:"wrap"}}>
+          <span style={{fontSize:12,color:W.textSec}}>{Math.round(pxDist)} px =</span>
+          <input className="wi" style={{width:90}} type="number" min="0" step="any" value={draft.len} onChange={e=>onLen(e.target.value)} placeholder="200" autoFocus/>
+          <select className="wsel" style={{width:80}} value={draft.unit} onChange={e=>onUnit(e.target.value)}>{SCALE_UNITS.map(u=><option key={u} value={u}>{u}</option>)}</select>
+          <button className="wbtn-ai" style={{fontSize:12}} onClick={onSave} disabled={!draft.len||parseFloat(draft.len)<=0}><i className="ti ti-check"/> Guardar calibración</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Detección de grano — panel (IA, SlimSAM) ───────────────────────────
+function SamPanel({sam,ppl,xpl,calib,onStart,onImgClick,onSaveSpot,onDismiss}){
+  if(!ppl&&!xpl)return null;
+  if(!sam.view&&!sam.busy){
+    return(
+      <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14,display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em",flex:"1 1 auto"}}><i className="ti ti-sparkles" style={{marginRight:5}}/>Detección de grano (IA — SlimSAM)</p>
+        {ppl&&<button className="wbtn" style={{fontSize:11}} onClick={()=>onStart("ppl")}><i className="ti ti-sparkles"/> Detectar en PPL</button>}
+        {xpl&&<button className="wbtn" style={{fontSize:11}} onClick={()=>onStart("xpl")}><i className="ti ti-sparkles"/> Detectar en XPL</button>}
+      </div>
+    );
+  }
+  const img=sam.view==="xpl"?xpl:ppl;
+  return(
+    <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-sparkles" style={{marginRight:5}}/>
+          Detección de grano — {sam.view==="xpl"?"XPL":"PPL"}{sam.busy?` · ${sam.busyMsg}`:sam.armed&&!sam.result?" · clic sobre un grano":""}
+        </p>
+        <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onDismiss}><i className="ti ti-x"/> Cerrar</button>
+      </div>
+      {sam.error&&<p style={{fontSize:12,color:W.danger,margin:"0 0 10px"}}>{sam.error}</p>}
+      <div style={{position:"relative",maxWidth:520,lineHeight:0,cursor:sam.armed&&!sam.busy?"crosshair":"default",opacity:sam.busy?0.6:1}}
+        onClick={e=>{if(!sam.armed||sam.busy)return;const r=e.currentTarget.getBoundingClientRect();onImgClick((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height);}}>
+        <img src={img.url} alt="" style={{width:"100%",display:"block",borderRadius:8}}/>
+        {sam.result&&<img src={sam.result.maskUrl} alt="" style={{position:"absolute",inset:0,width:"100%",height:"100%",borderRadius:8,pointerEvents:"none"}}/>}
+      </div>
+      {sam.result&&(
+        <div style={{display:"flex",gap:10,alignItems:"center",marginTop:12,flexWrap:"wrap"}}>
+          <span style={{fontSize:12,color:W.textSec}}>
+            Área ≈ {sam.result.areaPx.toLocaleString()} px²{calib&&calib.view===sam.view?` (~${(sam.result.areaPx/(calib.pxPerUnit*calib.pxPerUnit)).toFixed(1)} ${calib.unit}²)`:""} · score {sam.result.score.toFixed(2)}
+          </span>
+          <button className="wbtn" style={{fontSize:11}} onClick={onSaveSpot}><i className="ti ti-map-pin-plus"/> Guardar como spot</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Conteo de puntos (análisis modal) ─────────────────────────────────
 const PC_PRESETS=[100,300,500];
-function PointCountPanel({pc,ppl,xpl,rtype,onStart,onTarget,onView,onOpenEdit,onAssign,onCancelEdit,onMove,onApply,onReset}){
+function PointCountPanel({pc,ppl,xpl,rtype,calib,onStart,onTarget,onView,onOpenEdit,onAssign,onCancelEdit,onMove,onApply,onReset}){
   if(!pc.active){
     const hasAny=ppl||xpl;
     if(!hasAny)return null;
@@ -700,10 +857,11 @@ function PointCountPanel({pc,ppl,xpl,rtype,onStart,onTarget,onView,onOpenEdit,on
   counted.forEach(p=>{const k=p.mineral.trim();tally[k]=(tally[k]||0)+1;});
   const total=counted.length;
   const editPt=pc.editIdx!=null?pc.points[pc.editIdx]:null;
+  const spacing=(calib&&calib.view===pc.view)?(((img.w/pc.cols)+(img.h/pc.rows))/2/calib.pxPerUnit):null;
   return(
     <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
-        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-grid-dots" style={{marginRight:5}}/>Conteo de puntos — {pc.view==="xpl"?"XPL":"PPL"} · {total}/{pc.points.length}</p>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-grid-dots" style={{marginRight:5}}/>Conteo de puntos — {pc.view==="xpl"?"XPL":"PPL"} · {total}/{pc.points.length}{spacing!=null?` · espaciado real ≈ ${spacing.toFixed(1)} ${calib.unit}`:""}</p>
         <div style={{display:"flex",gap:8}}>
           <button className="wbtn" style={{fontSize:11}} onClick={onApply} disabled={total===0}><i className="ti ti-forms"/> Aplicar % a Minerales</button>
           <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onReset}><i className="ti ti-x"/> Reiniciar</button>
@@ -740,6 +898,89 @@ function PointCountPanel({pc,ppl,xpl,rtype,onStart,onTarget,onView,onOpenEdit,on
                 <span style={{color:W.textPri}}>{name}</span><span style={{color:W.textSec}}>{(n/total*100).toFixed(1)}%</span>
               </div>
             ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Spots libres (anotaciones puntuales sobre la imagen) ──────────────
+function SpotsPanel({spots,spotsView,spotAdding,spotEditId,ppl,xpl,minerals,onToggleAdding,onSetView,onImgClick,onOpenEdit,onUpdSpot,onDeleteSpot,onCloseEdit,onAddPhoto,onRemovePhoto}){
+  if(!ppl&&!xpl)return null;
+  const view=spotsView||(xpl?"xpl":"ppl");
+  const img=view==="xpl"?xpl:ppl;
+  if(!img)return null;
+  const viewSpots=spots.filter(sp=>sp.view===view);
+  const editSpot=spotEditId!=null?spots.find(sp=>sp.id===spotEditId):null;
+  return(
+    <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-map-pin" style={{marginRight:5}}/>Spots — {view==="xpl"?"XPL":"PPL"} · {viewSpots.length}</p>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          {ppl&&<label style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:"pointer"}}><input type="radio" name="spview" checked={view==="ppl"} onChange={()=>onSetView("ppl")}/>PPL</label>}
+          {xpl&&<label style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:"pointer"}}><input type="radio" name="spview" checked={view==="xpl"} onChange={()=>onSetView("xpl")}/>XPL</label>}
+          <button className="wbtn" style={{fontSize:11,background:spotAdding?W.accentLt:W.cardBg,borderColor:spotAdding?W.accentBt:W.inputBd,color:spotAdding?W.accentDk:W.textSec}} onClick={onToggleAdding}><i className="ti ti-map-pin-plus"/> {spotAdding?"Clic en la imagen para agregar…":"Agregar spot"}</button>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+        <div style={{position:"relative",flex:"1 1 420px",minWidth:260,lineHeight:0,cursor:spotAdding?"crosshair":"default"}}
+          onClick={e=>{if(!spotAdding)return;const r=e.currentTarget.getBoundingClientRect();onImgClick((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height);}}>
+          <img src={img.url} alt="" style={{width:"100%",display:"block",borderRadius:8}}/>
+          {viewSpots.map(sp=>(
+            <div key={sp.id} onClick={e=>{e.stopPropagation();onOpenEdit(sp.id);}} title={sp.label||"(sin etiqueta)"}
+              style={{position:"absolute",left:`${sp.x*100}%`,top:`${sp.y*100}%`,width:14,height:14,marginLeft:-7,marginTop:-7,borderRadius:"50% 50% 50% 0",transform:"rotate(-45deg)",cursor:"pointer",
+                background:SPOT_COLORS[sp.type]||W.textSec,border:sp.id===spotEditId?`2px solid ${W.danger}`:"1px solid rgba(255,255,255,0.7)",boxSizing:"border-box",zIndex:sp.id===spotEditId?2:1}}/>
+          ))}
+        </div>
+        <div style={{flex:"1 1 240px",minWidth:220}}>
+          {editSpot?(
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <input className="wi-lg" value={editSpot.label} onChange={e=>onUpdSpot(editSpot.id,{label:e.target.value})} placeholder="Etiqueta (ej. Plagioclasa alterada)"/>
+              <input className="wi" list="ts-spot-type" value={editSpot.type} onChange={e=>onUpdSpot(editSpot.id,{type:e.target.value})} placeholder="Tipo (mineral, contacto, venilla…)"/>
+              <datalist id="ts-spot-type">{SPOT_TYPES.map(t=><option key={t} value={t}/>)}</datalist>
+              <textarea className="wta" rows={3} value={editSpot.note} onChange={e=>onUpdSpot(editSpot.id,{note:e.target.value})} placeholder="Nota…"/>
+              <select className="wsel" value={editSpot.mineralId||""} onChange={e=>onUpdSpot(editSpot.id,{mineralId:e.target.value})}>
+                <option value="">— sin mineral vinculado —</option>
+                {minerals.map(m=><option key={m.id} value={m.id}>{m.name||"(sin nombre)"}</option>)}
+              </select>
+              <div>
+                <p style={{margin:"0 0 6px",fontSize:11,fontWeight:500,color:W.textSec}}>Fotos de detalle</p>
+                <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:8}}>
+                  {editSpot.photos.map((ph,i)=>(
+                    <div key={i} style={{width:76}}>
+                      <div style={{position:"relative"}}>
+                        <img src={ph.url} style={{width:76,height:76,objectFit:"cover",borderRadius:6,border:`1px solid ${W.border}`}}/>
+                        <button onClick={()=>onRemovePhoto(editSpot.id,i)} style={{position:"absolute",top:-6,right:-6,width:18,height:18,borderRadius:"50%",background:W.danger,color:"#fff",border:"none",cursor:"pointer",fontSize:10,lineHeight:"18px",padding:0}}><i className="ti ti-x"/></button>
+                      </div>
+                      <select className="wsel" style={{fontSize:9,padding:"2px 4px",marginTop:3}} value={ph.mag} onChange={e=>onUpdSpot(editSpot.id,{photos:editSpot.photos.map((p,j)=>j===i?{...p,mag:e.target.value}:p)})}>
+                        {OBJ_MAGS.map(m=><option key={m} value={m}>{m}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <label className="wbtn" style={{fontSize:11,cursor:"pointer",display:"inline-flex"}}>
+                  <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>{if(e.target.files[0])onAddPhoto(editSpot.id,e.target.files[0]);e.target.value="";}}/>
+                  <i className="ti ti-camera-plus"/> Agregar foto
+                </label>
+              </div>
+              <div style={{display:"flex",gap:8,marginTop:4}}>
+                <button className="wbtn" style={{fontSize:11}} onClick={onCloseEdit}><i className="ti ti-check"/> Cerrar</button>
+                <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={()=>onDeleteSpot(editSpot.id)}><i className="ti ti-trash"/> Eliminar spot</button>
+              </div>
+            </div>
+          ):(
+            viewSpots.length===0
+              ?<p style={{fontSize:11,color:W.textTer}}>Sin spots en esta imagen. Activa "Agregar spot" y haz clic en la foto.</p>
+              :<div style={{display:"flex",flexDirection:"column",gap:4}}>
+                {viewSpots.map(sp=>(
+                  <div key={sp.id} onClick={()=>onOpenEdit(sp.id)} style={{display:"flex",alignItems:"center",gap:7,cursor:"pointer",padding:"5px 7px",borderRadius:6,fontSize:12}}>
+                    <span style={{width:9,height:9,borderRadius:"50%",background:SPOT_COLORS[sp.type]||W.textSec,flexShrink:0}}/>
+                    <span style={{color:W.textPri,fontWeight:500}}>{sp.label||"(sin etiqueta)"}</span>
+                    {sp.type&&<span style={{color:W.textTer,fontSize:11}}>· {sp.type}</span>}
+                  </div>
+                ))}
+              </div>
+          )}
         </div>
       </div>
     </div>
@@ -914,6 +1155,84 @@ function App(){
     upd({minerals});
   };
   const pcReset=()=>updPC({active:false,view:s.pointCount.view,points:[],cursor:-1,editIdx:null});
+
+  const spotIsEmpty=sp=>!sp.label&&!sp.type&&!sp.note&&!sp.mineralId&&sp.photos.length===0;
+  const setSpotsView=v=>upd({spotsView:v});
+  const toggleSpotAdding=()=>upd({spotAdding:!s.spotAdding,spotEditId:null});
+  const spotImgClick=(x,y)=>{
+    const view=s.spotsView||(s.xpl?"xpl":"ppl");
+    const sp={id:Date.now(),view,x,y,label:"",type:"",note:"",mineralId:"",photos:[]};
+    upd({spots:[...s.spots,sp],spotEditId:sp.id});
+  };
+  const spotOpenEdit=id=>upd({spotEditId:id,spotAdding:false});
+  const updSpot=(id,patch)=>upd({spots:s.spots.map(sp=>sp.id===id?{...sp,...patch}:sp)});
+  const deleteSpot=id=>upd({spots:s.spots.filter(sp=>sp.id!==id),spotEditId:s.spotEditId===id?null:s.spotEditId});
+  const closeSpotEdit=()=>{
+    const sp=s.spots.find(x=>x.id===s.spotEditId);
+    upd({spotEditId:null,spots:sp&&spotIsEmpty(sp)?s.spots.filter(x=>x.id!==sp.id):s.spots});
+  };
+  const addSpotPhoto=(id,file)=>{
+    resizeImage(file).then(v=>{
+      const sp=s.spots.find(x=>x.id===id);
+      if(sp)updSpot(id,{photos:[...sp.photos,{...v,mag:"—"}]});
+    }).catch(err=>alert("No se pudo procesar la imagen: "+err.message));
+  };
+  const removeSpotPhoto=(id,idx)=>{
+    const sp=s.spots.find(x=>x.id===id);
+    if(sp)updSpot(id,{photos:sp.photos.filter((_,i)=>i!==idx)});
+  };
+
+  const startCalib=view=>upd({calibDraft:{view,x1:null,y1:null,x2:null,y2:null,len:"",unit:s.meta.scaleUnit||"μm"}});
+  const cancelCalib=()=>upd({calibDraft:null});
+  const calibImgClick=(x,y)=>{
+    const d=s.calibDraft;
+    if(!d)return;
+    if(d.x1==null)upd({calibDraft:{...d,x1:x,y1:y}});
+    else if(d.x2==null)upd({calibDraft:{...d,x2:x,y2:y}});
+    else upd({calibDraft:{...d,x1:x,y1:y,x2:null,y2:null}});
+  };
+  const setCalibLen=v=>upd({calibDraft:{...s.calibDraft,len:v}});
+  const setCalibUnit=v=>upd({calibDraft:{...s.calibDraft,unit:v}});
+  const saveCalib=()=>{
+    const d=s.calibDraft,img=d.view==="xpl"?s.xpl:s.ppl,len=parseFloat(d.len);
+    if(!len||len<=0)return;
+    const pxDist=Math.hypot((d.x2-d.x1)*img.w,(d.y2-d.y1)*img.h);
+    upd({calib:{view:d.view,x1:d.x1,y1:d.y1,x2:d.x2,y2:d.y2,len,unit:d.unit,pxPerUnit:pxDist/len},calibDraft:null});
+  };
+  const clearCalib=()=>upd({calib:null});
+
+  // Update funcional (no upd/s) — samStart/samImgClick disparan varias actualizaciones separadas
+  // por awaits, y un merge basado en el "s" cerrado en el momento de la llamada pisaría los cambios
+  // intermedios con el snapshot viejo.
+  const updSam=p=>setSamples(prev=>prev.map(x=>x.id===aid?{...x,sam:{...x.sam,...p}}:x));
+  const samStart=async view=>{
+    updSam({view,armed:false,busy:true,busyMsg:"Cargando modelo IA…",error:null,result:null});
+    try{
+      await loadSamModel();
+      updSam({busyMsg:"Preparando imagen…"});
+      await encodeSamImage(view,view==="xpl"?s.xpl:s.ppl);
+      updSam({busy:false,armed:true});
+    }catch(e){
+      updSam({busy:false,armed:false,error:"No se pudo cargar el modelo de IA (requiere internet la primera vez). "+(e?.message||"")});
+    }
+  };
+  const samImgClick=async(x,y)=>{
+    updSam({busy:true,busyMsg:"Analizando…",result:null});
+    try{
+      const result=await runSamDecode(x,y,s.sam.view==="xpl"?s.xpl:s.ppl);
+      updSam({busy:false,result:{x,y,...result}});
+    }catch(e){
+      updSam({busy:false,error:"No se pudo analizar ese punto. "+(e?.message||"")});
+    }
+  };
+  const samSaveSpot=()=>{
+    const r=s.sam.result;
+    if(!r)return;
+    const areaTxt=`Área detectada por IA (SlimSAM): ~${r.areaPx.toLocaleString()} px²`+((s.calib&&s.calib.view===s.sam.view)?` (~${(r.areaPx/(s.calib.pxPerUnit*s.calib.pxPerUnit)).toFixed(1)} ${s.calib.unit}²)`:"");
+    const sp={id:Date.now(),view:s.sam.view,x:r.x,y:r.y,label:"",type:"",note:areaTxt,mineralId:"",photos:[]};
+    upd({spots:[...s.spots,sp],spotEditId:sp.id,sam:{...s.sam,result:null}});
+  };
+  const samDismiss=()=>upd({sam:{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}});
 
   const withCoords=samples.filter(x=>parseUTM(x.meta));
 
@@ -1132,13 +1451,19 @@ ${AI_ROCK_SCHEMA}`}];
             {tab==="imgs"&&(
               <div>
                 <div style={{display:"flex",gap:14}}>
-                  <ImgZone img={s.ppl} label="Nícoles paralelos (PPL)" onFile={f=>loadImg("ppl",f)} onClear={()=>upd({ppl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="ppl"?false:s.pointCount.active}})}/>
-                  <ImgZone img={s.xpl} label="Nícoles cruzados (XPL)" onFile={f=>loadImg("xpl",f)} onClear={()=>upd({xpl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="xpl"?false:s.pointCount.active}})}/>
+                  <ImgZone img={s.ppl} label="Nícoles paralelos (PPL)" onFile={f=>loadImg("ppl",f)} onClear={()=>upd({ppl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="ppl"?false:s.pointCount.active},spots:s.spots.filter(sp=>sp.view!=="ppl"),calib:s.calib?.view==="ppl"?null:s.calib,sam:s.sam.view==="ppl"?{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}:s.sam})}/>
+                  <ImgZone img={s.xpl} label="Nícoles cruzados (XPL)" onFile={f=>loadImg("xpl",f)} onClear={()=>upd({xpl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="xpl"?false:s.pointCount.active},spots:s.spots.filter(sp=>sp.view!=="xpl"),calib:s.calib?.view==="xpl"?null:s.calib,sam:s.sam.view==="xpl"?{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}:s.sam})}/>
                 </div>
                 <datalist id={`ts-min-${RTSLUG[s.meta.rtype]}`}>{[...(MINERALS_TYPICAL[s.meta.rtype]?.essential||[]),...(MINERALS_TYPICAL[s.meta.rtype]?.accessory||[])].map(o=><option key={o} value={o}/>)}</datalist>
-                <PointCountPanel pc={s.pointCount} ppl={s.ppl} xpl={s.xpl} rtype={s.meta.rtype}
+                <CalibPanel calib={s.calib} draft={s.calibDraft} ppl={s.ppl} xpl={s.xpl}
+                  onStart={startCalib} onCancel={cancelCalib} onImgClick={calibImgClick} onLen={setCalibLen} onUnit={setCalibUnit} onSave={saveCalib} onClear={clearCalib}/>
+                <PointCountPanel pc={s.pointCount} ppl={s.ppl} xpl={s.xpl} rtype={s.meta.rtype} calib={s.calib}
                   onStart={pcStart} onTarget={n=>updPC({targetN:n})} onView={v=>updPC({view:v})}
                   onOpenEdit={pcOpenEdit} onAssign={pcAssign} onCancelEdit={pcCancelEdit} onMove={pcMove} onApply={pcApply} onReset={pcReset}/>
+                <SpotsPanel spots={s.spots} spotsView={s.spotsView} spotAdding={s.spotAdding} spotEditId={s.spotEditId} ppl={s.ppl} xpl={s.xpl} minerals={s.minerals}
+                  onToggleAdding={toggleSpotAdding} onSetView={setSpotsView} onImgClick={spotImgClick} onOpenEdit={spotOpenEdit} onUpdSpot={updSpot}
+                  onDeleteSpot={deleteSpot} onCloseEdit={closeSpotEdit} onAddPhoto={addSpotPhoto} onRemovePhoto={removeSpotPhoto}/>
+                <SamPanel sam={s.sam} ppl={s.ppl} xpl={s.xpl} calib={s.calib} onStart={samStart} onImgClick={samImgClick} onSaveSpot={samSaveSpot} onDismiss={samDismiss}/>
               </div>
             )}
 

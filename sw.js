@@ -5,7 +5,7 @@
      primer uso online quedan disponibles offline.
    - Las llamadas a la API de Anthropic son POST y nunca se cachean.
 */
-const CACHE = "cortes-v3";
+const CACHE = "cortes-v6";
 const SHELL = [
   "./",
   "./index.html",
