@@ -329,7 +329,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 <script type="text/babel" data-presets="react">
 const { useState, useRef } = React;
 
-const APP_VERSION="v1";
+const APP_VERSION="v2";
 
 const W = {
   pageBg:"#F5F0E8",sidebarBg:"#EAE3D6",sidebarAct:"#DDD4C2",
@@ -534,6 +534,28 @@ const mkS=n=>({
   protolith:"",metamorphicGrade:"—",facies:"—",
 });
 const mkMin=()=>{const m={id:Date.now()};["name","pct","habit","sz","cleavage","cPPL","relief","nRefr","pleo","cXPL","ramsay","ext","twins","v2","altMins","altType","obs"].forEach(k=>m[k]="");m.optChar="—";m.altDeg="—";return m;};
+
+// 1568px = techo útil de visión de Claude/Gemini (más allá de eso lo re-escalan solos, pagando tokens de más)
+const IMG_MAX_DIM=1568;
+const resizeImage=file=>new Promise((resolve,reject)=>{
+  const r=new FileReader();
+  r.onerror=()=>reject(r.error);
+  r.onload=e=>{
+    const img=new Image();
+    img.onerror=()=>reject(new Error("No se pudo leer la imagen"));
+    img.onload=()=>{
+      const scale=Math.min(1,IMG_MAX_DIM/Math.max(img.width,img.height));
+      const w=Math.round(img.width*scale),h=Math.round(img.height*scale);
+      const cv=document.createElement("canvas");
+      cv.width=w;cv.height=h;
+      cv.getContext("2d").drawImage(img,0,0,w,h);
+      const url=cv.toDataURL("image/jpeg",0.85);
+      resolve({url,b64:url.split(",")[1],mime:"image/jpeg"});
+    };
+    img.src=e.target.result;
+  };
+  r.readAsDataURL(file);
+});
 
 // ── Glosario: contexto + botón "?" ────────────────────────────────────
 const HelpCtx=React.createContext(()=>{});
@@ -757,7 +779,7 @@ function App(){
   const upd=p=>setSamples(prev=>prev.map(x=>x.id===aid?{...x,...p}:x));
   const updM=(k,v)=>upd({meta:{...s.meta,[k]:v}});
 
-  const loadImg=(type,file)=>{const r=new FileReader();r.onload=e=>{const url=e.target.result;upd({[type]:{url,b64:url.split(",")[1],mime:file.type}});};r.readAsDataURL(file);};
+  const loadImg=(type,file)=>{resizeImage(file).then(v=>upd({[type]:v})).catch(err=>alert("No se pudo procesar la imagen: "+err.message));};
   const addMin=()=>upd({minerals:[...s.minerals,mkMin()]});
   const updMin=(id,k,v)=>upd({minerals:s.minerals.map(m=>m.id===id?{...m,[k]:v}:m)});
   const delMin=id=>upd({minerals:s.minerals.filter(m=>m.id!==id)});
