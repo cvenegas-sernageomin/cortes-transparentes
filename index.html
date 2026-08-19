@@ -329,7 +329,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 <script type="text/babel" data-presets="react">
 const { useState, useRef } = React;
 
-const APP_VERSION="v2";
+const APP_VERSION="v3";
 
 const W = {
   pageBg:"#F5F0E8",sidebarBg:"#EAE3D6",sidebarAct:"#DDD4C2",
@@ -527,6 +527,7 @@ const mkS=n=>({
   meta:{sid:"",fm:"",loc:"",este:"",norte:"",zona:"19S",col:"",date:"",rtype:"volcánica",sedLithology:"Siliciclástica",
         objMag:"—",scaleBar:"",scaleUnit:"μm"},
   ppl:null,xpl:null,
+  pointCount:{active:false,view:null,targetN:300,cols:0,rows:0,points:[],cursor:-1,editIdx:null},
   techniques:["PPL / XPL"],
   texture:"",structure:"",rockName:"",classification:"",desc:"",minerals:[],ai:"",aiParsed:null,
   colorIndex:"",phenocrystPct:"",qapf:{q:"",a:"",p:"",f:""},
@@ -550,12 +551,23 @@ const resizeImage=file=>new Promise((resolve,reject)=>{
       cv.width=w;cv.height=h;
       cv.getContext("2d").drawImage(img,0,0,w,h);
       const url=cv.toDataURL("image/jpeg",0.85);
-      resolve({url,b64:url.split(",")[1],mime:"image/jpeg"});
+      resolve({url,b64:url.split(",")[1],mime:"image/jpeg",w,h});
     };
     img.src=e.target.result;
   };
   r.readAsDataURL(file);
 });
+
+// Grilla regular de conteo de puntos: filas/columnas elegidas para que las celdas
+// sean lo más cuadradas posible según el aspecto real de la imagen.
+const genGrid=(w,h,targetN)=>{
+  const aspect=w/h;
+  let cols=Math.max(1,Math.round(Math.sqrt(targetN*aspect)));
+  let rows=Math.max(1,Math.round(targetN/cols));
+  const points=[];
+  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++)points.push({id:r*cols+c,row:r,col:c,x:(c+0.5)/cols,y:(r+0.5)/rows,mineral:""});
+  return{cols,rows,points};
+};
 
 // ── Glosario: contexto + botón "?" ────────────────────────────────────
 const HelpCtx=React.createContext(()=>{});
@@ -653,6 +665,83 @@ function ImgZone({img,label,onFile,onClear}){
       </div>
       <input ref={inp} type="file" accept="image/*" style={{display:"none"}} onChange={e=>{if(e.target.files[0])onFile(e.target.files[0]);e.target.value="";}}/>
       {img&&<button className="wbtn" onClick={()=>inp.current?.click()} style={{fontSize:11,justifyContent:"center"}}><i className="ti ti-replace"/> Cambiar imagen</button>}
+    </div>
+  );
+}
+
+// ── Conteo de puntos (análisis modal) ─────────────────────────────────
+const PC_PRESETS=[100,300,500];
+function PointCountPanel({pc,ppl,xpl,rtype,onStart,onTarget,onView,onOpenEdit,onAssign,onCancelEdit,onMove,onApply,onReset}){
+  if(!pc.active){
+    const hasAny=ppl||xpl;
+    if(!hasAny)return null;
+    return(
+      <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
+        <p style={{margin:"0 0 10px",fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-grid-dots" style={{marginRight:5}}/>Conteo de puntos (análisis modal)</p>
+        <div style={{display:"flex",flexWrap:"wrap",gap:14,alignItems:"center"}}>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{fontSize:11,color:W.textSec}}>Imagen:</span>
+            {ppl&&<label style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:"pointer"}}><input type="radio" name="pcview" checked={pc.view==="ppl"||(!pc.view&&!xpl)} onChange={()=>onView("ppl")}/>PPL</label>}
+            {xpl&&<label style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:"pointer"}}><input type="radio" name="pcview" checked={pc.view==="xpl"||(!pc.view&&!ppl)} onChange={()=>onView("xpl")}/>XPL</label>}
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{fontSize:11,color:W.textSec}}>Puntos objetivo:</span>
+            {PC_PRESETS.map(n=><button key={n} onClick={()=>onTarget(n)} className="wbtn" style={{fontSize:11,padding:"3px 10px",background:pc.targetN===n?W.accentLt:W.cardBg,borderColor:pc.targetN===n?W.accentBt:W.inputBd,color:pc.targetN===n?W.accentDk:W.textSec}}>{n}</button>)}
+          </div>
+          <button className="wbtn-ai" style={{fontSize:12}} onClick={onStart}><i className="ti ti-player-play"/> Iniciar conteo</button>
+        </div>
+      </div>
+    );
+  }
+  const img=pc.view==="xpl"?xpl:ppl;
+  if(!img)return null;
+  const counted=pc.points.filter(p=>p.mineral);
+  const tally={};
+  counted.forEach(p=>{const k=p.mineral.trim();tally[k]=(tally[k]||0)+1;});
+  const total=counted.length;
+  const editPt=pc.editIdx!=null?pc.points[pc.editIdx]:null;
+  return(
+    <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-grid-dots" style={{marginRight:5}}/>Conteo de puntos — {pc.view==="xpl"?"XPL":"PPL"} · {total}/{pc.points.length}</p>
+        <div style={{display:"flex",gap:8}}>
+          <button className="wbtn" style={{fontSize:11}} onClick={onApply} disabled={total===0}><i className="ti ti-forms"/> Aplicar % a Minerales</button>
+          <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onReset}><i className="ti ti-x"/> Reiniciar</button>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+        <div style={{position:"relative",flex:"1 1 420px",minWidth:260,lineHeight:0}} tabIndex={0} onKeyDown={e=>{
+          if(editPt)return;
+          if(e.key==="ArrowRight")onMove(1,0);else if(e.key==="ArrowLeft")onMove(-1,0);else if(e.key==="ArrowDown")onMove(0,1);else if(e.key==="ArrowUp")onMove(0,-1);
+          else if((e.key==="Enter"||e.key===" ")&&pc.cursor>=0){e.preventDefault();onOpenEdit(pc.cursor);}
+        }}>
+          <img src={img.url} alt="" style={{width:"100%",display:"block",borderRadius:8}}/>
+          {pc.points.map((p,i)=>(
+            <div key={p.id} onClick={()=>onOpenEdit(i)} title={p.mineral||"sin asignar"}
+              style={{position:"absolute",left:`${p.x*100}%`,top:`${p.y*100}%`,width:9,height:9,marginLeft:-4.5,marginTop:-4.5,borderRadius:"50%",cursor:"pointer",
+                background:p.mineral?W.accentMid:"rgba(255,255,255,0.55)",
+                border:i===pc.cursor?`2px solid ${W.danger}`:`1px solid ${p.mineral?W.accentDk:W.textSec}`,
+                boxSizing:"border-box",zIndex:i===pc.cursor?2:1}}/>
+          ))}
+          {editPt&&(
+            <div style={{position:"absolute",left:`${editPt.x*100}%`,top:`${editPt.y*100}%`,transform:"translate(-50%,10px)",zIndex:3,background:W.cardBg,border:`1px solid ${W.accentBt}`,borderRadius:8,padding:8,boxShadow:"0 2px 10px rgba(0,0,0,0.18)",width:190}}>
+              <input autoFocus className="wi" list={`ts-min-${RTSLUG[rtype]}`} defaultValue={editPt.mineral} placeholder="mineral…"
+                onKeyDown={e=>{if(e.key==="Enter"){onAssign(pc.editIdx,e.target.value);}else if(e.key==="Escape"){onCancelEdit();}}}
+                onBlur={onCancelEdit}/>
+              <p style={{margin:"5px 0 0",fontSize:10,color:W.textTer}}>Enter para guardar y saltar al siguiente · Esc/clic afuera cancela</p>
+            </div>
+          )}
+        </div>
+        <div style={{flex:"0 0 180px",minWidth:150}}>
+          <p style={{margin:"0 0 6px",fontSize:11,fontWeight:500,color:W.textSec}}>% modal (en vivo)</p>
+          {Object.keys(tally).length===0?<p style={{fontSize:11,color:W.textTer}}>Sin puntos contados aún.</p>:
+            Object.entries(tally).sort((a,b)=>b[1]-a[1]).map(([name,n])=>(
+              <div key={name} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"3px 0",borderBottom:`1px solid ${W.borderSub}`}}>
+                <span style={{color:W.textPri}}>{name}</span><span style={{color:W.textSec}}>{(n/total*100).toFixed(1)}%</span>
+              </div>
+            ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -784,6 +873,47 @@ function App(){
   const updMin=(id,k,v)=>upd({minerals:s.minerals.map(m=>m.id===id?{...m,[k]:v}:m)});
   const delMin=id=>upd({minerals:s.minerals.filter(m=>m.id!==id)});
   const toggleTech=t=>upd({techniques:s.techniques.includes(t)?s.techniques.filter(x=>x!==t):[...s.techniques,t]});
+
+  const updPC=p=>upd({pointCount:{...s.pointCount,...p}});
+  const pcStart=()=>{
+    const view=s.pointCount.view||(s.xpl?"xpl":"ppl");
+    const img=view==="xpl"?s.xpl:s.ppl;
+    if(!img)return;
+    const g=genGrid(img.w,img.h,s.pointCount.targetN);
+    updPC({active:true,view,cols:g.cols,rows:g.rows,points:g.points,cursor:0,editIdx:null});
+  };
+  const pcOpenEdit=idx=>updPC({editIdx:idx,cursor:idx});
+  const pcCancelEdit=()=>updPC({editIdx:null});
+  const pcAssign=(idx,name)=>{
+    const points=s.pointCount.points.map((p,i)=>i===idx?{...p,mineral:name.trim()}:p);
+    let next=null;
+    for(let k=1;k<=points.length;k++){const j=(idx+k)%points.length;if(!points[j].mineral){next=j;break;}}
+    updPC({points,editIdx:next,cursor:next!=null?next:idx});
+  };
+  const pcMove=(dx,dy)=>{
+    const{cols,rows,points,cursor}=s.pointCount;
+    if(cursor<0||!points.length)return;
+    const row=Math.min(rows-1,Math.max(0,points[cursor].row+dy));
+    const col=Math.min(cols-1,Math.max(0,points[cursor].col+dx));
+    const found=points.findIndex(p=>p.row===row&&p.col===col);
+    if(found>=0)updPC({cursor:found});
+  };
+  const pcApply=()=>{
+    const counted=s.pointCount.points.filter(p=>p.mineral);
+    if(!counted.length)return;
+    const tally={};
+    counted.forEach(p=>{const k=p.mineral.trim();tally[k]=(tally[k]||0)+1;});
+    const total=counted.length;
+    let minerals=[...s.minerals];
+    Object.entries(tally).forEach(([name,n])=>{
+      const pct=Math.round(n/total*1000)/10;
+      const idx=minerals.findIndex(m=>m.name.trim().toLowerCase()===name.toLowerCase());
+      if(idx>=0)minerals[idx]={...minerals[idx],pct};
+      else minerals.push({...mkMin(),name,pct});
+    });
+    upd({minerals});
+  };
+  const pcReset=()=>updPC({active:false,view:s.pointCount.view,points:[],cursor:-1,editIdx:null});
 
   const withCoords=samples.filter(x=>parseUTM(x.meta));
 
@@ -1000,9 +1130,15 @@ ${AI_ROCK_SCHEMA}`}];
           <div style={{flex:1,overflow:"auto",padding:14,background:W.pageBg}}>
 
             {tab==="imgs"&&(
-              <div style={{display:"flex",gap:14,height:"calc(100% - 4px)"}}>
-                <ImgZone img={s.ppl} label="Nícoles paralelos (PPL)" onFile={f=>loadImg("ppl",f)} onClear={()=>upd({ppl:null})}/>
-                <ImgZone img={s.xpl} label="Nícoles cruzados (XPL)" onFile={f=>loadImg("xpl",f)} onClear={()=>upd({xpl:null})}/>
+              <div>
+                <div style={{display:"flex",gap:14}}>
+                  <ImgZone img={s.ppl} label="Nícoles paralelos (PPL)" onFile={f=>loadImg("ppl",f)} onClear={()=>upd({ppl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="ppl"?false:s.pointCount.active}})}/>
+                  <ImgZone img={s.xpl} label="Nícoles cruzados (XPL)" onFile={f=>loadImg("xpl",f)} onClear={()=>upd({xpl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="xpl"?false:s.pointCount.active}})}/>
+                </div>
+                <datalist id={`ts-min-${RTSLUG[s.meta.rtype]}`}>{[...(MINERALS_TYPICAL[s.meta.rtype]?.essential||[]),...(MINERALS_TYPICAL[s.meta.rtype]?.accessory||[])].map(o=><option key={o} value={o}/>)}</datalist>
+                <PointCountPanel pc={s.pointCount} ppl={s.ppl} xpl={s.xpl} rtype={s.meta.rtype}
+                  onStart={pcStart} onTarget={n=>updPC({targetN:n})} onView={v=>updPC({view:v})}
+                  onOpenEdit={pcOpenEdit} onAssign={pcAssign} onCancelEdit={pcCancelEdit} onMove={pcMove} onApply={pcApply} onReset={pcReset}/>
               </div>
             )}
 
