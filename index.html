@@ -329,7 +329,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 <script type="text/babel" data-presets="react">
 const { useState, useRef } = React;
 
-const APP_VERSION="v6";
+const APP_VERSION="v11";
 
 const W = {
   pageBg:"#F5F0E8",sidebarBg:"#EAE3D6",sidebarAct:"#DDD4C2",
@@ -530,9 +530,10 @@ const mkS=n=>({
         objMag:"—",scaleBar:"",scaleUnit:"μm"},
   ppl:null,xpl:null,
   pointCount:{active:false,view:null,targetN:300,cols:0,rows:0,points:[],cursor:-1,editIdx:null},
-  spots:[],spotsView:null,spotAdding:false,spotEditId:null,
+  spots:[],spotsView:null,spotMode:null,spotDraft:null,spotEditId:null,
   calib:null,calibDraft:null,
   sam:{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null},
+  grainSizes:[],
   techniques:["PPL / XPL"],
   texture:"",structure:"",rockName:"",classification:"",desc:"",minerals:[],ai:"",aiParsed:null,
   colorIndex:"",phenocrystPct:"",qapf:{q:"",a:"",p:"",f:""},
@@ -540,6 +541,30 @@ const mkS=n=>({
   protolith:"",metamorphicGrade:"—",facies:"—",
 });
 const mkMin=()=>{const m={id:Date.now()};["name","pct","habit","sz","cleavage","cPPL","relief","nRefr","pleo","cXPL","ramsay","ext","twins","v2","altMins","altType","obs"].forEach(k=>m[k]="");m.optChar="—";m.altDeg="—";return m;};
+
+// Resumen del conteo de puntos (usado en reporte, KMZ y SHP) — null si no hay puntos contados aún.
+const pointCountSummary=s=>{
+  const counted=s.pointCount.points.filter(p=>p.mineral);
+  if(!counted.length)return null;
+  const tally={};counted.forEach(p=>{const k=p.mineral.trim();tally[k]=(tally[k]||0)+1;});
+  const total=counted.length;
+  const pctStr=Object.entries(tally).sort((a,b)=>b[1]-a[1]).map(([n,c])=>`${n} ${(c/total*100).toFixed(1)}%`).join(", ");
+  return{view:s.pointCount.view,cols:s.pointCount.cols,rows:s.pointCount.rows,total,ofTotal:s.pointCount.points.length,pctStr};
+};
+// Spots con el nombre del mineral vinculado ya resuelto (en vez de solo el id).
+const spotSummaries=s=>s.spots.map(sp=>{
+  const img=sp.view==="xpl"?s.xpl:s.ppl;
+  return{...sp,mineralName:sp.mineralId?(s.minerals.find(m=>String(m.id)===String(sp.mineralId))?.name||""):"",measure:spotMeasureText(sp,img,s.calib)};
+});
+// Estadísticos de la distribución de tamaño de grano — null si la lista está vacía.
+const grainSizeSummary=s=>{
+  if(!s.grainSizes.length)return null;
+  const diams=s.grainSizes.map(g=>g.diam).sort((a,b)=>a-b);
+  const n=diams.length;
+  const mean=diams.reduce((a,b)=>a+b,0)/n;
+  const median=n%2?diams[(n-1)/2]:(diams[n/2-1]+diams[n/2])/2;
+  return{n,mean,median,min:diams[0],max:diams[n-1],unit:s.grainSizes[0].unit};
+};
 
 // 1568px = techo útil de visión de Claude/Gemini (más allá de eso lo re-escalan solos, pagando tokens de más)
 const IMG_MAX_DIM=1568;
@@ -572,6 +597,22 @@ const genGrid=(w,h,targetN)=>{
   const points=[];
   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++)points.push({id:r*cols+c,row:r,col:c,x:(c+0.5)/cols,y:(r+0.5)/rows,mineral:""});
   return{cols,rows,points};
+};
+
+// Atajos de teclado para conteo de puntos: una letra por mineral, derivada de s.minerals.
+// Para cada mineral (en orden) se prueba su 1ª letra, luego 2ª, 3ª… hasta encontrar una libre; si ninguna, sin atajo.
+const buildShortcutMap=(minerals)=>{
+  const map={};
+  (minerals||[]).forEach(m=>{
+    if(!m.name)return;
+    const name=m.name.trim();
+    for(let i=0;i<name.length;i++){
+      const letter=name[i].toUpperCase();
+      if(!/[A-Z]/.test(letter))continue;
+      if(!map[letter]){map[letter]=name;break;}
+    }
+  });
+  return map;
 };
 
 // ── Detección de grano por IA (SlimSAM vía transformers.js, en el navegador) ──
@@ -788,7 +829,7 @@ function CalibPanel({calib,draft,ppl,xpl,onStart,onCancel,onImgClick,onLen,onUni
 }
 
 // ── Detección de grano — panel (IA, SlimSAM) ───────────────────────────
-function SamPanel({sam,ppl,xpl,calib,onStart,onImgClick,onSaveSpot,onDismiss}){
+function SamPanel({sam,ppl,xpl,calib,onStart,onImgClick,onSaveSpot,onAddGrain,onDismiss}){
   if(!ppl&&!xpl)return null;
   if(!sam.view&&!sam.busy){
     return(
@@ -819,16 +860,75 @@ function SamPanel({sam,ppl,xpl,calib,onStart,onImgClick,onSaveSpot,onDismiss}){
           <span style={{fontSize:12,color:W.textSec}}>
             Área ≈ {sam.result.areaPx.toLocaleString()} px²{calib&&calib.view===sam.view?` (~${(sam.result.areaPx/(calib.pxPerUnit*calib.pxPerUnit)).toFixed(1)} ${calib.unit}²)`:""} · score {sam.result.score.toFixed(2)}
           </span>
-          <button className="wbtn" style={{fontSize:11}} onClick={onSaveSpot}><i className="ti ti-map-pin-plus"/> Guardar como spot</button>
+          <button className="wbtn" style={{fontSize:11}} onClick={onSaveSpot}><i className="ti ti-map-pin-plus"/> Guardar como anotación</button>
+          {calib&&calib.view===sam.view
+            ?<button className="wbtn" style={{fontSize:11}} onClick={onAddGrain}><i className="ti ti-chart-histogram"/> Agregar a distribución de tamaño</button>
+            :<span style={{fontSize:11,color:W.textTer}}>Calibra la escala en esta vista para sumarlo a la distribución de tamaño.</span>}
         </div>
       )}
     </div>
   );
 }
 
+// ── Distribución de tamaño de grano (acumulado desde detección IA) ────
+function GrainSizePanel({grains,onRemove,onClear}){
+  if(!grains.length)return null;
+  const unit=grains[0].unit;
+  const mixed=grains.some(g=>g.unit!==unit);
+  const diams=grains.map(g=>g.diam).sort((a,b)=>a-b);
+  const n=diams.length;
+  const mean=diams.reduce((a,b)=>a+b,0)/n;
+  const median=n%2?diams[(n-1)/2]:(diams[n/2-1]+diams[n/2])/2;
+  const min=diams[0],max=diams[n-1];
+  const NBINS=Math.min(8,Math.max(3,Math.ceil(Math.sqrt(n))));
+  const span=(max-min)||1;
+  const bins=new Array(NBINS).fill(0);
+  diams.forEach(d=>{const idx=Math.min(NBINS-1,Math.floor((d-min)/span*NBINS));bins[idx]++;});
+  const maxBin=Math.max(...bins);
+  return(
+    <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-chart-histogram" style={{marginRight:5}}/>Distribución de tamaño de grano — n={n}</p>
+        <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onClear}><i className="ti ti-trash"/> Limpiar lista</button>
+      </div>
+      {mixed&&<p style={{fontSize:11,color:W.danger,margin:"0 0 10px"}}>⚠ hay medidas en distintas unidades — revisa la lista antes de interpretar el histograma.</p>}
+      <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+        <div style={{flex:"0 0 150px"}}>
+          <div style={{display:"flex",flexDirection:"column",gap:4,fontSize:12}}>
+            <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:W.textSec}}>Media</span><span>{mean.toFixed(1)} {unit}</span></div>
+            <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:W.textSec}}>Mediana</span><span>{median.toFixed(1)} {unit}</span></div>
+            <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:W.textSec}}>Mínimo</span><span>{min.toFixed(1)} {unit}</span></div>
+            <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:W.textSec}}>Máximo</span><span>{max.toFixed(1)} {unit}</span></div>
+          </div>
+        </div>
+        <div style={{flex:"1 1 260px",minWidth:220}}>
+          <div style={{display:"flex",alignItems:"flex-end",gap:3,height:90}}>
+            {bins.map((c,i)=>(
+              <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-end",height:"100%"}} title={`${c} grano(s)`}>
+                <div style={{width:"100%",background:W.accentMid,borderRadius:"3px 3px 0 0",height:`${maxBin?c/maxBin*100:0}%`,minHeight:c>0?3:0}}/>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:W.textTer,marginTop:4}}>
+            <span>{min.toFixed(0)}</span><span>{max.toFixed(0)} {unit} (diám. equiv.)</span>
+          </div>
+        </div>
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:12}}>
+        {grains.map(g=>(
+          <span key={g.id} style={{fontSize:11,background:W.rowAlt,borderRadius:6,padding:"3px 8px",display:"inline-flex",alignItems:"center",gap:5}}>
+            {g.diam.toFixed(1)} {g.unit}
+            <i className="ti ti-x" style={{cursor:"pointer",color:W.textTer}} onClick={()=>onRemove(g.id)}/>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Conteo de puntos (análisis modal) ─────────────────────────────────
 const PC_PRESETS=[100,300,500];
-function PointCountPanel({pc,ppl,xpl,rtype,calib,onStart,onTarget,onView,onOpenEdit,onAssign,onCancelEdit,onMove,onApply,onReset}){
+function PointCountPanel({pc,ppl,xpl,rtype,calib,onStart,onTarget,onView,onOpenEdit,onAssign,onAssignQuick,onCancelEdit,onMove,onApply,onReset,onExportCSV,minerals}){
   if(!pc.active){
     const hasAny=ppl||xpl;
     if(!hasAny)return null;
@@ -858,20 +958,24 @@ function PointCountPanel({pc,ppl,xpl,rtype,calib,onStart,onTarget,onView,onOpenE
   const total=counted.length;
   const editPt=pc.editIdx!=null?pc.points[pc.editIdx]:null;
   const spacing=(calib&&calib.view===pc.view)?(((img.w/pc.cols)+(img.h/pc.rows))/2/calib.pxPerUnit):null;
+  const shortcuts=buildShortcutMap(minerals);
   return(
     <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
         <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-grid-dots" style={{marginRight:5}}/>Conteo de puntos — {pc.view==="xpl"?"XPL":"PPL"} · {total}/{pc.points.length}{spacing!=null?` · espaciado real ≈ ${spacing.toFixed(1)} ${calib.unit}`:""}</p>
         <div style={{display:"flex",gap:8}}>
           <button className="wbtn" style={{fontSize:11}} onClick={onApply} disabled={total===0}><i className="ti ti-forms"/> Aplicar % a Minerales</button>
+          <button className="wbtn" style={{fontSize:11}} onClick={onExportCSV} disabled={pc.points.length===0}><i className="ti ti-download"/> Exportar CSV</button>
           <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onReset}><i className="ti ti-x"/> Reiniciar</button>
         </div>
       </div>
+      {Object.keys(shortcuts).length>0&&<p style={{margin:"0 0 10px",fontSize:10,color:W.textTer}}>Atajos: {Object.entries(shortcuts).map(([k,v])=>`${k}=${v}`).join(", ")}</p>}
       <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
         <div style={{position:"relative",flex:"1 1 420px",minWidth:260,lineHeight:0}} tabIndex={0} onKeyDown={e=>{
           if(editPt)return;
           if(e.key==="ArrowRight")onMove(1,0);else if(e.key==="ArrowLeft")onMove(-1,0);else if(e.key==="ArrowDown")onMove(0,1);else if(e.key==="ArrowUp")onMove(0,-1);
           else if((e.key==="Enter"||e.key===" ")&&pc.cursor>=0){e.preventDefault();onOpenEdit(pc.cursor);}
+          else if(e.key.length===1&&/[a-zA-Z]/.test(e.key)&&pc.cursor>=0&&shortcuts[e.key.toUpperCase()]){e.preventDefault();onAssignQuick(pc.cursor,shortcuts[e.key.toUpperCase()]);}
         }}>
           <img src={img.url} alt="" style={{width:"100%",display:"block",borderRadius:8}}/>
           {pc.points.map((p,i)=>(
@@ -904,38 +1008,75 @@ function PointCountPanel({pc,ppl,xpl,rtype,calib,onStart,onTarget,onView,onOpenE
   );
 }
 
-// ── Spots libres (anotaciones puntuales sobre la imagen) ──────────────
-function SpotsPanel({spots,spotsView,spotAdding,spotEditId,ppl,xpl,minerals,onToggleAdding,onSetView,onImgClick,onOpenEdit,onUpdSpot,onDeleteSpot,onCloseEdit,onAddPhoto,onRemovePhoto}){
+// ── Spots libres (punto / línea / polígono) sobre la imagen ────────────
+const SPOT_GEOMS=[["point","Punto"],["line","Línea"],["polygon","Polígono"]];
+const geomLabel=g=>g==="line"?"línea":g==="polygon"?"polígono":"punto";
+const polylineLenPx=(pts,img)=>{let d=0;for(let i=1;i<pts.length;i++)d+=Math.hypot((pts[i].x-pts[i-1].x)*img.w,(pts[i].y-pts[i-1].y)*img.h);return d;};
+const polygonAreaPx=(pts,img)=>{let a=0;for(let i=0;i<pts.length;i++){const p1=pts[i],p2=pts[(i+1)%pts.length];a+=(p1.x*img.w)*(p2.y*img.h)-(p2.x*img.w)*(p1.y*img.h);}return Math.abs(a)/2;};
+// Texto de medida real (o en px si no hay calibración para esa vista) — usado en el panel, el reporte y el KMZ.
+const spotMeasureText=(sp,img,calib)=>{
+  if(!img||sp.geom==="point")return null;
+  if(sp.geom==="line"){
+    const px=polylineLenPx(sp.pts,img);
+    const real=calib&&calib.view===sp.view?px/calib.pxPerUnit:null;
+    return`longitud ${Math.round(px)} px${real!=null?` (~${real.toFixed(1)} ${calib.unit})`:""}`;
+  }
+  const px=polygonAreaPx(sp.pts,img);
+  const real=calib&&calib.view===sp.view?px/(calib.pxPerUnit*calib.pxPerUnit):null;
+  return`área ${Math.round(px)} px²${real!=null?` (~${real.toFixed(1)} ${calib.unit}²)`:""}`;
+};
+function SpotsPanel({spots,spotsView,spotMode,spotDraft,spotEditId,ppl,xpl,minerals,calib,onSetMode,onSetView,onImgClick,onFinishDraft,onCancelDraft,onOpenEdit,onUpdSpot,onDeleteSpot,onCloseEdit,onAddPhoto,onRemovePhoto}){
   if(!ppl&&!xpl)return null;
   const view=spotsView||(xpl?"xpl":"ppl");
   const img=view==="xpl"?xpl:ppl;
   if(!img)return null;
   const viewSpots=spots.filter(sp=>sp.view===view);
   const editSpot=spotEditId!=null?spots.find(sp=>sp.id===spotEditId):null;
+  const drawing=spotDraft&&spotDraft.view===view?spotDraft:null;
+  const minPts=drawing&&drawing.geom==="line"?2:3;
   return(
     <div style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:14,marginTop:14}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
-        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-map-pin" style={{marginRight:5}}/>Spots — {view==="xpl"?"XPL":"PPL"} · {viewSpots.length}</p>
-        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+        <p style={{margin:0,fontSize:11,fontWeight:600,color:W.accentDk,textTransform:"uppercase",letterSpacing:"0.06em"}}><i className="ti ti-map-pin" style={{marginRight:5}}/>Anotaciones — {view==="xpl"?"XPL":"PPL"} · {viewSpots.length}</p>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
           {ppl&&<label style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:"pointer"}}><input type="radio" name="spview" checked={view==="ppl"} onChange={()=>onSetView("ppl")}/>PPL</label>}
           {xpl&&<label style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:"pointer"}}><input type="radio" name="spview" checked={view==="xpl"} onChange={()=>onSetView("xpl")}/>XPL</label>}
-          <button className="wbtn" style={{fontSize:11,background:spotAdding?W.accentLt:W.cardBg,borderColor:spotAdding?W.accentBt:W.inputBd,color:spotAdding?W.accentDk:W.textSec}} onClick={onToggleAdding}><i className="ti ti-map-pin-plus"/> {spotAdding?"Clic en la imagen para agregar…":"Agregar spot"}</button>
+          {SPOT_GEOMS.map(([g,lbl])=>(
+            <button key={g} className="wbtn" style={{fontSize:11,background:spotMode===g?W.accentLt:W.cardBg,borderColor:spotMode===g?W.accentBt:W.inputBd,color:spotMode===g?W.accentDk:W.textSec}} onClick={()=>onSetMode(spotMode===g?null:g)}>{lbl}</button>
+          ))}
         </div>
       </div>
+      {drawing&&(
+        <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10,fontSize:12,color:W.textSec,flexWrap:"wrap"}}>
+          <span>Dibujando {geomLabel(drawing.geom)} — {drawing.pts.length} punto(s) (mín. {minPts})</span>
+          <button className="wbtn" style={{fontSize:11}} onClick={onFinishDraft} disabled={drawing.pts.length<minPts}><i className="ti ti-check"/> Finalizar</button>
+          <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={onCancelDraft}><i className="ti ti-x"/> Cancelar</button>
+        </div>
+      )}
       <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
-        <div style={{position:"relative",flex:"1 1 420px",minWidth:260,lineHeight:0,cursor:spotAdding?"crosshair":"default"}}
-          onClick={e=>{if(!spotAdding)return;const r=e.currentTarget.getBoundingClientRect();onImgClick((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height);}}>
+        <div style={{position:"relative",flex:"1 1 420px",minWidth:260,lineHeight:0,cursor:spotMode?"crosshair":"default"}}
+          onClick={e=>{if(!spotMode)return;const r=e.currentTarget.getBoundingClientRect();onImgClick((e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height);}}
+          onDoubleClick={e=>{if(drawing){e.preventDefault();onFinishDraft();}}}>
           <img src={img.url} alt="" style={{width:"100%",display:"block",borderRadius:8}}/>
-          {viewSpots.map(sp=>(
-            <div key={sp.id} onClick={e=>{e.stopPropagation();onOpenEdit(sp.id);}} title={sp.label||"(sin etiqueta)"}
-              style={{position:"absolute",left:`${sp.x*100}%`,top:`${sp.y*100}%`,width:14,height:14,marginLeft:-7,marginTop:-7,borderRadius:"50% 50% 50% 0",transform:"rotate(-45deg)",cursor:"pointer",
-                background:SPOT_COLORS[sp.type]||W.textSec,border:sp.id===spotEditId?`2px solid ${W.danger}`:"1px solid rgba(255,255,255,0.7)",boxSizing:"border-box",zIndex:sp.id===spotEditId?2:1}}/>
-          ))}
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{position:"absolute",inset:0,width:"100%",height:"100%",pointerEvents:"none"}}>
+            {viewSpots.map(sp=>{
+              const color=SPOT_COLORS[sp.type]||W.textSec;
+              const active=sp.id===spotEditId;
+              if(sp.geom==="line")return<polyline key={sp.id} points={sp.pts.map(p=>`${p.x*100},${p.y*100}`).join(" ")} fill="none" stroke={color} strokeWidth={active?1.2:0.7} vectorEffect="non-scaling-stroke" style={{pointerEvents:"stroke",cursor:"pointer"}} onClick={ev=>{ev.stopPropagation();onOpenEdit(sp.id);}}/>;
+              if(sp.geom==="polygon")return<polygon key={sp.id} points={sp.pts.map(p=>`${p.x*100},${p.y*100}`).join(" ")} fill={color} fillOpacity={0.25} stroke={color} strokeWidth={active?1.2:0.7} vectorEffect="non-scaling-stroke" style={{pointerEvents:"all",cursor:"pointer"}} onClick={ev=>{ev.stopPropagation();onOpenEdit(sp.id);}}/>;
+              return<circle key={sp.id} cx={sp.pts[0].x*100} cy={sp.pts[0].y*100} r={active?1.6:1.1} fill={color} stroke="#fff" strokeWidth={0.3} vectorEffect="non-scaling-stroke" style={{pointerEvents:"all",cursor:"pointer"}} onClick={ev=>{ev.stopPropagation();onOpenEdit(sp.id);}}/>;
+            })}
+            {drawing&&drawing.pts.length>0&&(drawing.geom==="polygon"
+              ?<polygon points={drawing.pts.map(p=>`${p.x*100},${p.y*100}`).join(" ")} fill={W.accentBt} fillOpacity={0.15} stroke={W.accentDk} strokeWidth={0.6} strokeDasharray="1.5,1" vectorEffect="non-scaling-stroke"/>
+              :<polyline points={drawing.pts.map(p=>`${p.x*100},${p.y*100}`).join(" ")} fill="none" stroke={W.accentDk} strokeWidth={0.6} strokeDasharray="1.5,1" vectorEffect="non-scaling-stroke"/>)}
+            {drawing&&drawing.pts.map((p,i)=><circle key={i} cx={p.x*100} cy={p.y*100} r={1} fill={W.accentDk}/>)}
+          </svg>
         </div>
         <div style={{flex:"1 1 240px",minWidth:220}}>
           {editSpot?(
             <div style={{display:"flex",flexDirection:"column",gap:8}}>
-              <input className="wi-lg" value={editSpot.label} onChange={e=>onUpdSpot(editSpot.id,{label:e.target.value})} placeholder="Etiqueta (ej. Plagioclasa alterada)"/>
+              {editSpot.geom!=="point"&&<p style={{margin:0,fontSize:12,color:W.textSec}}>{spotMeasureText(editSpot,img,calib)}</p>}
+              <input className="wi-lg" value={editSpot.label} onChange={e=>onUpdSpot(editSpot.id,{label:e.target.value})} placeholder="Etiqueta (ej. Venilla de cuarzo)"/>
               <input className="wi" list="ts-spot-type" value={editSpot.type} onChange={e=>onUpdSpot(editSpot.id,{type:e.target.value})} placeholder="Tipo (mineral, contacto, venilla…)"/>
               <datalist id="ts-spot-type">{SPOT_TYPES.map(t=><option key={t} value={t}/>)}</datalist>
               <textarea className="wta" rows={3} value={editSpot.note} onChange={e=>onUpdSpot(editSpot.id,{note:e.target.value})} placeholder="Nota…"/>
@@ -965,18 +1106,19 @@ function SpotsPanel({spots,spotsView,spotAdding,spotEditId,ppl,xpl,minerals,onTo
               </div>
               <div style={{display:"flex",gap:8,marginTop:4}}>
                 <button className="wbtn" style={{fontSize:11}} onClick={onCloseEdit}><i className="ti ti-check"/> Cerrar</button>
-                <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={()=>onDeleteSpot(editSpot.id)}><i className="ti ti-trash"/> Eliminar spot</button>
+                <button className="wbtn" style={{fontSize:11,color:W.danger}} onClick={()=>onDeleteSpot(editSpot.id)}><i className="ti ti-trash"/> Eliminar anotación</button>
               </div>
             </div>
           ):(
             viewSpots.length===0
-              ?<p style={{fontSize:11,color:W.textTer}}>Sin spots en esta imagen. Activa "Agregar spot" y haz clic en la foto.</p>
+              ?<p style={{fontSize:11,color:W.textTer}}>Sin anotaciones en esta imagen. Elegí Punto/Línea/Polígono y hacé clic en la foto (doble clic o "Finalizar" para cerrar línea/polígono).</p>
               :<div style={{display:"flex",flexDirection:"column",gap:4}}>
                 {viewSpots.map(sp=>(
                   <div key={sp.id} onClick={()=>onOpenEdit(sp.id)} style={{display:"flex",alignItems:"center",gap:7,cursor:"pointer",padding:"5px 7px",borderRadius:6,fontSize:12}}>
-                    <span style={{width:9,height:9,borderRadius:"50%",background:SPOT_COLORS[sp.type]||W.textSec,flexShrink:0}}/>
+                    <span style={{width:9,height:9,borderRadius:sp.geom==="point"?"50%":2,background:SPOT_COLORS[sp.type]||W.textSec,flexShrink:0}}/>
                     <span style={{color:W.textPri,fontWeight:500}}>{sp.label||"(sin etiqueta)"}</span>
                     {sp.type&&<span style={{color:W.textTer,fontSize:11}}>· {sp.type}</span>}
+                    <span style={{color:W.textTer,fontSize:10}}>· {geomLabel(sp.geom)}</span>
                   </div>
                 ))}
               </div>
@@ -1104,15 +1246,30 @@ function App(){
   const [aiProvider,setAiProviderState]=useState(()=>{try{return localStorage.getItem("ai_provider")||"anthropic";}catch(e){return "anthropic";}});
   const setAiProvider=v=>{setAiProviderState(v);try{localStorage.setItem("ai_provider",v);}catch(e){}};
   const [helpKey,setHelpKey]=useState(null);
+  const [undoStack,setUndoStack]=useState([]);
 
   const s=samples.find(x=>x.id===aid)||samples[0];
   const upd=p=>setSamples(prev=>prev.map(x=>x.id===aid?{...x,...p}:x));
+  // Snapshot antes de una acción destructiva (borrar imagen/mineral/anotación, reiniciar conteo, etc.)
+  // — no en cada upd(), solo antes de las acciones que de verdad pierden trabajo.
+  const pushUndo=(label,sid)=>setUndoStack(prev=>[...prev,{sampleId:sid??aid,snapshot:sid?samples.find(x=>x.id===sid):s,label}].slice(-10));
+  const topUndo=undoStack[undoStack.length-1];
+  // Además del caso normal (deshacer algo de la muestra activa), si la muestra del undo fue
+  // eliminada por completo, ofrecemos deshacer igual sin importar cuál esté activa ahora.
+  const canUndo=!!topUndo&&(topUndo.sampleId===aid||!samples.some(x=>x.id===topUndo.sampleId));
+  const undoLast=()=>{
+    if(!canUndo)return;
+    const entry=topUndo;
+    setSamples(prev=>prev.some(x=>x.id===entry.sampleId)?prev.map(x=>x.id===entry.sampleId?entry.snapshot:x):[...prev,entry.snapshot]);
+    setAid(entry.sampleId);
+    setUndoStack(prev=>prev.slice(0,-1));
+  };
   const updM=(k,v)=>upd({meta:{...s.meta,[k]:v}});
 
   const loadImg=(type,file)=>{resizeImage(file).then(v=>upd({[type]:v})).catch(err=>alert("No se pudo procesar la imagen: "+err.message));};
   const addMin=()=>upd({minerals:[...s.minerals,mkMin()]});
   const updMin=(id,k,v)=>upd({minerals:s.minerals.map(m=>m.id===id?{...m,[k]:v}:m)});
-  const delMin=id=>upd({minerals:s.minerals.filter(m=>m.id!==id)});
+  const delMin=id=>{pushUndo("Eliminar mineral");upd({minerals:s.minerals.filter(m=>m.id!==id)});};
   const toggleTech=t=>upd({techniques:s.techniques.includes(t)?s.techniques.filter(x=>x!==t):[...s.techniques,t]});
 
   const updPC=p=>upd({pointCount:{...s.pointCount,...p}});
@@ -1130,6 +1287,14 @@ function App(){
     let next=null;
     for(let k=1;k<=points.length;k++){const j=(idx+k)%points.length;if(!points[j].mineral){next=j;break;}}
     updPC({points,editIdx:next,cursor:next!=null?next:idx});
+  };
+  // Como pcAssign, pero sin abrir el popup en el siguiente punto — para atajos de teclado,
+  // donde querés seguir tipeando letras sin que el popup de texto libre se interponga.
+  const pcAssignQuick=(idx,name)=>{
+    const points=s.pointCount.points.map((p,i)=>i===idx?{...p,mineral:name.trim()}:p);
+    let next=null;
+    for(let k=1;k<=points.length;k++){const j=(idx+k)%points.length;if(!points[j].mineral){next=j;break;}}
+    updPC({points,cursor:next!=null?next:idx});
   };
   const pcMove=(dx,dy)=>{
     const{cols,rows,points,cursor}=s.pointCount;
@@ -1154,19 +1319,43 @@ function App(){
     });
     upd({minerals});
   };
-  const pcReset=()=>updPC({active:false,view:s.pointCount.view,points:[],cursor:-1,editIdx:null});
+  const pcReset=()=>{pushUndo("Reiniciar conteo de puntos");updPC({active:false,view:s.pointCount.view,points:[],cursor:-1,editIdx:null});};
+  const pcExportCSV=()=>{
+    const{cols,rows,points,view}=s.pointCount;
+    const counted=points.filter(p=>p.mineral).length;
+    const esc=v=>v.includes(",")?`"${v}"`:v;
+    const lines=[`# grilla ${cols}x${rows} · vista ${view==="xpl"?"XPL":"PPL"}`,`# puntos contados: ${counted}/${points.length}`,"punto,fila,columna,x_pct,y_pct,mineral"];
+    points.forEach((p,i)=>lines.push([i+1,p.row,p.col,(p.x*100).toFixed(2),(p.y*100).toFixed(2),esc(p.mineral||"")].join(",")));
+    const blob=new Blob([lines.join("\n")],{type:"text/csv"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`conteo_puntos_${view}.csv`;a.click();
+  };
 
   const spotIsEmpty=sp=>!sp.label&&!sp.type&&!sp.note&&!sp.mineralId&&sp.photos.length===0;
   const setSpotsView=v=>upd({spotsView:v});
-  const toggleSpotAdding=()=>upd({spotAdding:!s.spotAdding,spotEditId:null});
+  const setSpotMode=mode=>upd({spotMode:mode,spotDraft:null});
   const spotImgClick=(x,y)=>{
     const view=s.spotsView||(s.xpl?"xpl":"ppl");
-    const sp={id:Date.now(),view,x,y,label:"",type:"",note:"",mineralId:"",photos:[]};
-    upd({spots:[...s.spots,sp],spotEditId:sp.id});
+    if(s.spotMode==="point"){
+      const sp={id:Date.now(),view,geom:"point",pts:[{x,y}],label:"",type:"",note:"",mineralId:"",photos:[]};
+      upd({spots:[...s.spots,sp],spotEditId:sp.id});
+      return;
+    }
+    const d=s.spotDraft;
+    const draft=(d&&d.view===view&&d.geom===s.spotMode)?d:{view,geom:s.spotMode,pts:[]};
+    upd({spotDraft:{...draft,pts:[...draft.pts,{x,y}]}});
   };
-  const spotOpenEdit=id=>upd({spotEditId:id,spotAdding:false});
+  const finishSpotDraft=()=>{
+    const d=s.spotDraft;
+    if(!d)return;
+    const min=d.geom==="line"?2:3;
+    if(d.pts.length<min)return;
+    const sp={id:Date.now(),view:d.view,geom:d.geom,pts:d.pts,label:"",type:"",note:"",mineralId:"",photos:[]};
+    upd({spots:[...s.spots,sp],spotEditId:sp.id,spotDraft:null});
+  };
+  const cancelSpotDraft=()=>upd({spotDraft:null});
+  const spotOpenEdit=id=>upd({spotEditId:id,spotMode:null,spotDraft:null});
   const updSpot=(id,patch)=>upd({spots:s.spots.map(sp=>sp.id===id?{...sp,...patch}:sp)});
-  const deleteSpot=id=>upd({spots:s.spots.filter(sp=>sp.id!==id),spotEditId:s.spotEditId===id?null:s.spotEditId});
+  const deleteSpot=id=>{pushUndo("Eliminar anotación");upd({spots:s.spots.filter(sp=>sp.id!==id),spotEditId:s.spotEditId===id?null:s.spotEditId});};
   const closeSpotEdit=()=>{
     const sp=s.spots.find(x=>x.id===s.spotEditId);
     upd({spotEditId:null,spots:sp&&spotIsEmpty(sp)?s.spots.filter(x=>x.id!==sp.id):s.spots});
@@ -1199,7 +1388,7 @@ function App(){
     const pxDist=Math.hypot((d.x2-d.x1)*img.w,(d.y2-d.y1)*img.h);
     upd({calib:{view:d.view,x1:d.x1,y1:d.y1,x2:d.x2,y2:d.y2,len,unit:d.unit,pxPerUnit:pxDist/len},calibDraft:null});
   };
-  const clearCalib=()=>upd({calib:null});
+  const clearCalib=()=>{pushUndo("Quitar calibración");upd({calib:null});};
 
   // Update funcional (no upd/s) — samStart/samImgClick disparan varias actualizaciones separadas
   // por awaits, y un merge basado en el "s" cerrado en el momento de la llamada pisaría los cambios
@@ -1233,6 +1422,15 @@ function App(){
     upd({spots:[...s.spots,sp],spotEditId:sp.id,sam:{...s.sam,result:null}});
   };
   const samDismiss=()=>upd({sam:{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}});
+  const samAddGrain=()=>{
+    const r=s.sam.result;
+    if(!r||!s.calib||s.calib.view!==s.sam.view)return;
+    const diamPx=2*Math.sqrt(r.areaPx/Math.PI);
+    const g={id:Date.now(),diam:diamPx/s.calib.pxPerUnit,unit:s.calib.unit};
+    upd({grainSizes:[...s.grainSizes,g],sam:{...s.sam,result:null}});
+  };
+  const removeGrain=id=>upd({grainSizes:s.grainSizes.filter(g=>g.id!==id)});
+  const clearGrains=()=>{pushUndo("Vaciar distribución de tamaño de grano");upd({grainSizes:[]});};
 
   const withCoords=samples.filter(x=>parseUTM(x.meta));
 
@@ -1323,7 +1521,7 @@ ${AI_ROCK_SCHEMA}`}];
 
   const applyAI=(overwrite)=>{
     const p=s.aiParsed; if(!p)return;
-    if(overwrite&&!confirm("Esto reemplazará los campos y la lista de minerales actuales. ¿Continuar?"))return;
+    if(overwrite)pushUndo("Reemplazar con sugerencias de IA");
     const isEmpty=v=>v===undefined||v===null||v===""||v==="—";
     const keep=(cur,val)=>overwrite?(isEmpty(val)?cur:val):(isEmpty(cur)&&!isEmpty(val)?val:cur);
     const patch={
@@ -1352,20 +1550,41 @@ ${AI_ROCK_SCHEMA}`}];
       const pts=withCoords.map(x=>({...x,...parseUTM(x.meta)}));
       if(type==="kmz"){
         const marks=pts.map(sx=>{
-          const ph=[[sx.ppl,"PPL"],[sx.xpl,"XPL"]].filter(([p])=>p).map(([,l],i)=>`<img src="files/${sx.id}_${i}.jpg" width="280" style="margin:3px"/>`).join("");
-          const body=`${ph}<h3>${sx.name}</h3>${sx.meta.fm?`<p><b>Formación:</b> ${sx.meta.fm}</p>`:""}${sx.meta.loc?`<p><b>Localidad:</b> ${sx.meta.loc}</p>`:""}${sx.meta.este?`<p><b>UTM WGS84:</b> ${sx.meta.este}E / ${sx.meta.norte}N / Zona ${sx.meta.zona}</p>`:""}${sx.rockName?`<p><b>Nombre petrográfico:</b> ${sx.rockName}</p>`:""}${sx.texture?`<p><b>Textura:</b> ${sx.texture}</p>`:""}${sx.ai?`<p><b>Descripción IA:</b> ${sx.ai}</p>`:""}${sx.desc?`<p><b>Descripción:</b> ${sx.desc}</p>`:""}`;
+          const imgs=[[sx.ppl,"PPL"],[sx.xpl,"XPL"]].filter(([p])=>p);
+          const ph=imgs.map(([,l],i)=>`<img src="files/${sx.id}_${i}.jpg" width="280" style="margin:3px"/>`).join("");
+          const pcs=pointCountSummary(sx);
+          const sps=spotSummaries(sx);
+          const spotsHtml=sps.length?`<h4>Anotaciones</h4>${sps.map((sp,si)=>{
+            const photos=sp.photos.map((ph2,pi)=>`<img src="files/${sx.id}_sp${si}_${pi}.jpg" width="160" style="margin:2px"/>`).join("");
+            return `<p><b>${sp.label||"(sin etiqueta)"}</b>${sp.type?` [${sp.type}]`:""} — ${sp.view==="xpl"?"XPL":"PPL"} (${geomLabel(sp.geom)})${sp.measure?`<br/>${sp.measure}`:""}${sp.mineralName?`<br/>Mineral: ${sp.mineralName}`:""}${sp.note?`<br/>Nota: ${sp.note}`:""}${photos?`<br/>${photos}`:""}</p>`;
+          }).join("")}`:"";
+          const gss=grainSizeSummary(sx);
+          const body=`${ph}<h3>${sx.name}</h3>${sx.meta.fm?`<p><b>Formación:</b> ${sx.meta.fm}</p>`:""}${sx.meta.loc?`<p><b>Localidad:</b> ${sx.meta.loc}</p>`:""}${sx.meta.este?`<p><b>UTM WGS84:</b> ${sx.meta.este}E / ${sx.meta.norte}N / Zona ${sx.meta.zona}</p>`:""}${sx.calib?`<p><b>Escala calibrada:</b> ${sx.calib.pxPerUnit.toFixed(2)} px/${sx.calib.unit} (${sx.calib.view==="xpl"?"XPL":"PPL"})</p>`:""}${sx.rockName?`<p><b>Nombre petrográfico:</b> ${sx.rockName}</p>`:""}${sx.texture?`<p><b>Textura:</b> ${sx.texture}</p>`:""}${pcs?`<p><b>Análisis modal (conteo de puntos):</b> grilla ${pcs.cols}×${pcs.rows}, ${pcs.total}/${pcs.ofTotal} puntos — ${pcs.pctStr}</p>`:""}${gss?`<p><b>Tamaño de grano (n=${gss.n}):</b> media ${gss.mean.toFixed(1)} ${gss.unit}, mediana ${gss.median.toFixed(1)} ${gss.unit}, rango ${gss.min.toFixed(1)}–${gss.max.toFixed(1)} ${gss.unit}</p>`:""}${sx.ai?`<p><b>Descripción IA:</b> ${sx.ai}</p>`:""}${sx.desc?`<p><b>Descripción:</b> ${sx.desc}</p>`:""}${spotsHtml}`;
           return `<Placemark><name>${sx.name}</name><description><![CDATA[${body}]]></description><Point><coordinates>${sx.lon},${sx.lat},0</coordinates></Point></Placemark>`;
         }).join("\n");
         zip.file("doc.kml",`<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>Cortes transparentes</name>\n${marks}\n</Document></kml>`);
         const ff=zip.folder("files");
-        for(const sx of pts){if(sx.ppl?.b64)ff.file(`${sx.id}_0.jpg`,sx.ppl.b64,{base64:true});if(sx.xpl?.b64)ff.file(`${sx.id}_1.jpg`,sx.xpl.b64,{base64:true});}
+        for(const sx of pts){
+          [sx.ppl,sx.xpl].filter(p=>p).forEach((img,i)=>{if(img.b64)ff.file(`${sx.id}_${i}.jpg`,img.b64,{base64:true});});
+          sx.spots.forEach((sp,si)=>sp.photos.forEach((ph2,pi)=>{if(ph2.b64)ff.file(`${sx.id}_sp${si}_${pi}.jpg`,ph2.b64,{base64:true});}));
+        }
         const blob=await zip.generateAsync({type:"blob",mimeType:"application/vnd.google-earth.kmz"});
         const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="cortes_transparentes.kmz";a.click();
         setExpMsg("KMZ descargado correctamente.");
       }else{
         const{shp,shx}=bldSHP(pts);
-        const fd=[{name:"ID",type:"C",len:20},{name:"Muestra",type:"C",len:50},{name:"Formacion",type:"C",len:50},{name:"Localidad",type:"C",len:80},{name:"Este_m",type:"C",len:16},{name:"Norte_m",type:"C",len:16},{name:"ZonaUTM",type:"C",len:6},{name:"Fecha",type:"C",len:20},{name:"Colector",type:"C",len:50},{name:"TipoRoca",type:"C",len:30},{name:"NombrePet",type:"C",len:80},{name:"Textura",type:"C",len:80},{name:"Minerales",type:"C",len:200},{name:"Descripcion",type:"C",len:254}];
-        const recs=pts.map(sx=>({ID:sx.meta.sid,Muestra:sx.name,Formacion:sx.meta.fm,Localidad:sx.meta.loc,Este_m:sx.meta.este,Norte_m:sx.meta.norte,ZonaUTM:sx.meta.zona,Fecha:sx.meta.date,Colector:sx.meta.col,TipoRoca:sx.meta.rtype,NombrePet:sx.rockName,Textura:sx.texture,Minerales:sx.minerals.map(m=>m.name).filter(Boolean).join(", "),Descripcion:sx.desc||sx.ai||""}));
+        const fd=[{name:"ID",type:"C",len:20},{name:"Muestra",type:"C",len:50},{name:"Formacion",type:"C",len:50},{name:"Localidad",type:"C",len:80},{name:"Este_m",type:"C",len:16},{name:"Norte_m",type:"C",len:16},{name:"ZonaUTM",type:"C",len:6},{name:"Fecha",type:"C",len:20},{name:"Colector",type:"C",len:50},{name:"TipoRoca",type:"C",len:30},{name:"NombrePet",type:"C",len:80},{name:"Textura",type:"C",len:80},{name:"Minerales",type:"C",len:200},{name:"Escala",type:"C",len:40},{name:"ConteoPts",type:"C",len:150},{name:"Anotac",type:"C",len:254},{name:"TamGrano",type:"C",len:100},{name:"Descripcion",type:"C",len:254}];
+        const recs=pts.map(sx=>{
+          const pcs=pointCountSummary(sx);
+          const sps=spotSummaries(sx);
+          const gss=grainSizeSummary(sx);
+          return{ID:sx.meta.sid,Muestra:sx.name,Formacion:sx.meta.fm,Localidad:sx.meta.loc,Este_m:sx.meta.este,Norte_m:sx.meta.norte,ZonaUTM:sx.meta.zona,Fecha:sx.meta.date,Colector:sx.meta.col,TipoRoca:sx.meta.rtype,NombrePet:sx.rockName,Textura:sx.texture,Minerales:sx.minerals.map(m=>m.name).filter(Boolean).join(", "),
+            Escala:sx.calib?`${sx.calib.pxPerUnit.toFixed(2)} px/${sx.calib.unit} (${sx.calib.view==="xpl"?"XPL":"PPL"})`:"",
+            ConteoPts:pcs?`${pcs.total}/${pcs.ofTotal} pts, grilla ${pcs.cols}x${pcs.rows}: ${pcs.pctStr}`:"",
+            Anotac:sps.map(sp=>`${sp.label||"(sin etiqueta)"}${sp.type?` [${sp.type}]`:""}`).join("; "),
+            TamGrano:gss?`n=${gss.n}, media ${gss.mean.toFixed(1)} ${gss.unit}, mediana ${gss.median.toFixed(1)}`:"",
+            Descripcion:sx.desc||sx.ai||""};
+        });
         const dbf=bldDBF(recs,fd);
         const prj=`GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]`;
         zip.file("cortes.shp",shp);zip.file("cortes.shx",shx);zip.file("cortes.dbf",dbf);zip.file("cortes.prj",prj);
@@ -1379,7 +1598,7 @@ ${AI_ROCK_SCHEMA}`}];
 
   const makeReport=()=>{
     const m=s.meta;
-    const L=["DESCRIPCIÓN PETROGRÁFICA","=".repeat(46),"",`Muestra: ${s.name}`,m.sid&&`ID: ${m.sid}`,m.fm&&`Formación: ${m.fm}`,m.loc&&`Localidad: ${m.loc}`,(m.este&&m.norte)&&`UTM WGS84: ${m.este}E / ${m.norte}N / Zona ${m.zona}`,m.col&&`Colector/a: ${m.col}`,m.date&&`Fecha: ${m.date}`,`Tipo: ${m.rtype}`,m.rtype==="sedimentaria"&&`Litología: ${m.sedLithology}`,s.techniques.length&&`Técnicas: ${s.techniques.join(", ")}`,m.objMag!=="—"&&`Objetivo: ${m.objMag}`,m.scaleBar&&`Escala en foto: ${m.scaleBar} ${m.scaleUnit}`,""].filter(v=>v!==false&&v!==""&&v!==undefined);
+    const L=["DESCRIPCIÓN PETROGRÁFICA","=".repeat(46),"",`Muestra: ${s.name}`,m.sid&&`ID: ${m.sid}`,m.fm&&`Formación: ${m.fm}`,m.loc&&`Localidad: ${m.loc}`,(m.este&&m.norte)&&`UTM WGS84: ${m.este}E / ${m.norte}N / Zona ${m.zona}`,m.col&&`Colector/a: ${m.col}`,m.date&&`Fecha: ${m.date}`,`Tipo: ${m.rtype}`,m.rtype==="sedimentaria"&&`Litología: ${m.sedLithology}`,s.techniques.length&&`Técnicas: ${s.techniques.join(", ")}`,m.objMag!=="—"&&`Objetivo: ${m.objMag}`,m.scaleBar&&`Escala en foto: ${m.scaleBar} ${m.scaleUnit}`,s.calib&&`Escala calibrada (${s.calib.view==="xpl"?"XPL":"PPL"}): ${s.calib.pxPerUnit.toFixed(2)} px/${s.calib.unit}`,""].filter(v=>v!==false&&v!==""&&v!==undefined);
     if(s.rockName)L.push(`Nombre petrográfico: ${s.rockName}`);
     if(s.texture)L.push(`Textura: ${s.texture}`);
     if(s.structure)L.push(`Estructura: ${s.structure}`);
@@ -1399,6 +1618,12 @@ ${AI_ROCK_SCHEMA}`}];
       if(pf.length)L.push(`Pauta metamórfica: ${pf.join("; ")}`,"");
     }
     if(s.minerals.length){L.push("MINERALES:","-".repeat(38));s.minerals.forEach(mn=>{L.push(`\n• ${mn.name||"–"} (${mn.pct||"?"}% modal)`);const mo=[mn.habit&&`hábito: ${mn.habit}`,mn.sz&&`tamaño: ${mn.sz} mm`,mn.cleavage&&`clivaje: ${mn.cleavage}`].filter(Boolean).join(", ");if(mo)L.push(`  Morfología: ${mo}`);const pp=[mn.cPPL&&`color: ${mn.cPPL}`,mn.relief&&mn.relief!=="—"&&`relief: ${mn.relief}`,mn.nRefr&&`n: ${mn.nRefr}`,mn.pleo&&`pleocr.: ${mn.pleo}`].filter(Boolean).join(", ");if(pp)L.push(`  PPL: ${pp}`);const xp=[mn.cXPL&&`color interf.: ${mn.cXPL}`,mn.ramsay&&mn.ramsay!=="—"&&`Ramsay orden ${mn.ramsay}`,mn.ext&&`extinción: ${mn.ext}`,mn.twins&&`maclado: ${mn.twins}`].filter(Boolean).join(", ");if(xp)L.push(`  XPL: ${xp}`);if(mn.optChar&&mn.optChar!=="—")L.push(`  Carácter óptico: ${mn.optChar}${mn.v2?" · 2V: "+mn.v2:""}`);const al=[mn.altDeg&&mn.altDeg!=="—"&&`grado: ${mn.altDeg}`,mn.altType&&`tipo: ${mn.altType}`,mn.altMins&&`minerales: ${mn.altMins}`].filter(Boolean).join("; ");if(al)L.push(`  Alteración: ${al}`);if(mn.obs)L.push(`  Obs.: ${mn.obs}`);});L.push("");}
+    const pcs=pointCountSummary(s);
+    if(pcs)L.push("ANÁLISIS MODAL (conteo de puntos):","-".repeat(38),`Grilla ${pcs.cols}×${pcs.rows} sobre ${pcs.view==="xpl"?"XPL":"PPL"} — ${pcs.total}/${pcs.ofTotal} puntos contados.`,pcs.pctStr,"");
+    const sps=spotSummaries(s);
+    if(sps.length){L.push("ANOTACIONES:","-".repeat(38));sps.forEach(sp=>{L.push(`\n• ${sp.label||"(sin etiqueta)"}${sp.type?` [${sp.type}]`:""} — ${sp.view==="xpl"?"XPL":"PPL"} (${geomLabel(sp.geom)})`);if(sp.measure)L.push(`  Medida: ${sp.measure}`);if(sp.mineralName)L.push(`  Mineral vinculado: ${sp.mineralName}`);if(sp.note)L.push(`  Nota: ${sp.note}`);if(sp.photos.length)L.push(`  ${sp.photos.length} foto(s) de detalle (${sp.photos.map(p=>p.mag).filter(x=>x!=="—").join(", ")||"aumento no especificado"})`);});L.push("");}
+    const gss=grainSizeSummary(s);
+    if(gss)L.push("TAMAÑO DE GRANO (diámetro equivalente, n="+gss.n+"):","-".repeat(38),`Media: ${gss.mean.toFixed(1)} ${gss.unit} · Mediana: ${gss.median.toFixed(1)} ${gss.unit} · Rango: ${gss.min.toFixed(1)}–${gss.max.toFixed(1)} ${gss.unit}`,"");
     if(s.desc)L.push("\nDESCRIPCIÓN:",s.desc);
     return L.join("\n");
   };
@@ -1422,7 +1647,7 @@ ${AI_ROCK_SCHEMA}`}];
             {samples.map(sx=>(
               <div key={sx.id} onClick={()=>setAid(sx.id)} style={{padding:"7px 10px",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",gap:4,borderLeft:sx.id===aid?`3px solid ${W.accentMid}`:"3px solid transparent",background:sx.id===aid?W.sidebarAct:"transparent"}}>
                 <span style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:sx.id===aid?W.accentDk:W.textSec,fontWeight:sx.id===aid?500:400}}>{sx.name}</span>
-                {samples.length>1&&<button onClick={e=>{e.stopPropagation();const rem=samples.filter(x=>x.id!==sx.id);setSamples(rem);if(aid===sx.id)setAid(rem[0].id);}} style={{background:"none",border:"none",cursor:"pointer",color:W.textTer,padding:0,fontSize:12,fontFamily:"inherit"}}><i className="ti ti-x"/></button>}
+                {samples.length>1&&<button onClick={e=>{e.stopPropagation();pushUndo("Eliminar muestra",sx.id);const rem=samples.filter(x=>x.id!==sx.id);setSamples(rem);if(aid===sx.id)setAid(rem[0].id);}} style={{background:"none",border:"none",cursor:"pointer",color:W.textTer,padding:0,fontSize:12,fontFamily:"inherit"}}><i className="ti ti-x"/></button>}
               </div>
             ))}
           </div>
@@ -1435,6 +1660,7 @@ ${AI_ROCK_SCHEMA}`}];
         <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
           <div style={{padding:"9px 14px",borderBottom:`1px solid ${W.border}`,display:"flex",alignItems:"center",gap:10,background:W.cardBg}}>
             <input value={s.name} onChange={e=>upd({name:e.target.value})} style={{flex:1,fontSize:14,fontWeight:500,border:"none",background:"transparent",outline:"none",color:W.textPri,minWidth:0,fontFamily:"inherit"}} placeholder="Nombre de la muestra"/>
+            {canUndo&&<button className="wbtn" onClick={undoLast} title={topUndo.label} style={{fontSize:11}}><i className="ti ti-arrow-back-up"/> Deshacer: {topUndo.label}</button>}
             <button className="wbtn-ai" onClick={callAI} disabled={busy}><i className="ti ti-brain"/>{busy?"Analizando…":"Descripción con IA"}</button>
           </div>
 
@@ -1451,19 +1677,20 @@ ${AI_ROCK_SCHEMA}`}];
             {tab==="imgs"&&(
               <div>
                 <div style={{display:"flex",gap:14}}>
-                  <ImgZone img={s.ppl} label="Nícoles paralelos (PPL)" onFile={f=>loadImg("ppl",f)} onClear={()=>upd({ppl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="ppl"?false:s.pointCount.active},spots:s.spots.filter(sp=>sp.view!=="ppl"),calib:s.calib?.view==="ppl"?null:s.calib,sam:s.sam.view==="ppl"?{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}:s.sam})}/>
-                  <ImgZone img={s.xpl} label="Nícoles cruzados (XPL)" onFile={f=>loadImg("xpl",f)} onClear={()=>upd({xpl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="xpl"?false:s.pointCount.active},spots:s.spots.filter(sp=>sp.view!=="xpl"),calib:s.calib?.view==="xpl"?null:s.calib,sam:s.sam.view==="xpl"?{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}:s.sam})}/>
+                  <ImgZone img={s.ppl} label="Nícoles paralelos (PPL)" onFile={f=>loadImg("ppl",f)} onClear={()=>{pushUndo("Quitar imagen PPL");upd({ppl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="ppl"?false:s.pointCount.active},spots:s.spots.filter(sp=>sp.view!=="ppl"),calib:s.calib?.view==="ppl"?null:s.calib,sam:s.sam.view==="ppl"?{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}:s.sam});}}/>
+                  <ImgZone img={s.xpl} label="Nícoles cruzados (XPL)" onFile={f=>loadImg("xpl",f)} onClear={()=>{pushUndo("Quitar imagen XPL");upd({xpl:null,pointCount:{...s.pointCount,active:s.pointCount.view==="xpl"?false:s.pointCount.active},spots:s.spots.filter(sp=>sp.view!=="xpl"),calib:s.calib?.view==="xpl"?null:s.calib,sam:s.sam.view==="xpl"?{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}:s.sam});}}/>
                 </div>
                 <datalist id={`ts-min-${RTSLUG[s.meta.rtype]}`}>{[...(MINERALS_TYPICAL[s.meta.rtype]?.essential||[]),...(MINERALS_TYPICAL[s.meta.rtype]?.accessory||[])].map(o=><option key={o} value={o}/>)}</datalist>
                 <CalibPanel calib={s.calib} draft={s.calibDraft} ppl={s.ppl} xpl={s.xpl}
                   onStart={startCalib} onCancel={cancelCalib} onImgClick={calibImgClick} onLen={setCalibLen} onUnit={setCalibUnit} onSave={saveCalib} onClear={clearCalib}/>
-                <PointCountPanel pc={s.pointCount} ppl={s.ppl} xpl={s.xpl} rtype={s.meta.rtype} calib={s.calib}
+                <PointCountPanel pc={s.pointCount} ppl={s.ppl} xpl={s.xpl} rtype={s.meta.rtype} calib={s.calib} minerals={s.minerals}
                   onStart={pcStart} onTarget={n=>updPC({targetN:n})} onView={v=>updPC({view:v})}
-                  onOpenEdit={pcOpenEdit} onAssign={pcAssign} onCancelEdit={pcCancelEdit} onMove={pcMove} onApply={pcApply} onReset={pcReset}/>
-                <SpotsPanel spots={s.spots} spotsView={s.spotsView} spotAdding={s.spotAdding} spotEditId={s.spotEditId} ppl={s.ppl} xpl={s.xpl} minerals={s.minerals}
-                  onToggleAdding={toggleSpotAdding} onSetView={setSpotsView} onImgClick={spotImgClick} onOpenEdit={spotOpenEdit} onUpdSpot={updSpot}
+                  onOpenEdit={pcOpenEdit} onAssign={pcAssign} onAssignQuick={pcAssignQuick} onCancelEdit={pcCancelEdit} onMove={pcMove} onApply={pcApply} onReset={pcReset} onExportCSV={pcExportCSV}/>
+                <SpotsPanel spots={s.spots} spotsView={s.spotsView} spotMode={s.spotMode} spotDraft={s.spotDraft} spotEditId={s.spotEditId} ppl={s.ppl} xpl={s.xpl} minerals={s.minerals} calib={s.calib}
+                  onSetMode={setSpotMode} onSetView={setSpotsView} onImgClick={spotImgClick} onFinishDraft={finishSpotDraft} onCancelDraft={cancelSpotDraft} onOpenEdit={spotOpenEdit} onUpdSpot={updSpot}
                   onDeleteSpot={deleteSpot} onCloseEdit={closeSpotEdit} onAddPhoto={addSpotPhoto} onRemovePhoto={removeSpotPhoto}/>
-                <SamPanel sam={s.sam} ppl={s.ppl} xpl={s.xpl} calib={s.calib} onStart={samStart} onImgClick={samImgClick} onSaveSpot={samSaveSpot} onDismiss={samDismiss}/>
+                <SamPanel sam={s.sam} ppl={s.ppl} xpl={s.xpl} calib={s.calib} onStart={samStart} onImgClick={samImgClick} onSaveSpot={samSaveSpot} onAddGrain={samAddGrain} onDismiss={samDismiss}/>
+                <GrainSizePanel grains={s.grainSizes} onRemove={removeGrain} onClear={clearGrains}/>
               </div>
             )}
 
@@ -1653,8 +1880,8 @@ ${AI_ROCK_SCHEMA}`}];
             {tab==="exp"&&(
               <div style={{maxWidth:500,display:"flex",flexDirection:"column",gap:14}}>
                 {[
-                  {type:"kmz",icon:"ti-map-pin",title:"Google Earth (KMZ)",desc:"Marcador por muestra con imágenes PPL/XPL, nombre petrográfico y descripción. Coordenadas UTM convertidas a geográficas WGS84 para el archivo."},
-                  {type:"shp",icon:"ti-polygon",title:"Shapefile (SHP)",desc:"Capa de puntos WGS84 con tabla de atributos completa (formación, nombre petrográfico, minerales, descripción). Compatible con QGIS y ArcGIS. ZIP con .shp / .shx / .dbf / .prj."},
+                  {type:"kmz",icon:"ti-map-pin",title:"Google Earth (KMZ)",desc:"Marcador por muestra con imágenes PPL/XPL, nombre petrográfico, descripción, escala calibrada, conteo de puntos, tamaño de grano y anotaciones (con sus fotos de detalle). Coordenadas UTM convertidas a geográficas WGS84 para el archivo."},
+                  {type:"shp",icon:"ti-polygon",title:"Shapefile (SHP)",desc:"Capa de puntos WGS84 con tabla de atributos completa (formación, nombre petrográfico, minerales, escala calibrada, resumen del conteo de puntos, anotaciones, tamaño de grano, descripción). Compatible con QGIS y ArcGIS. ZIP con .shp / .shx / .dbf / .prj."},
                 ].map(({type,icon,title,desc})=>(
                   <div key={type} style={{background:W.cardBg,border:`1px solid ${W.border}`,borderRadius:10,padding:16}}>
                     <p style={{margin:"0 0 5px",fontSize:13,fontWeight:500,color:W.textPri}}><i className={`ti ${icon}`} style={{marginRight:6}}/>{title}</p>
