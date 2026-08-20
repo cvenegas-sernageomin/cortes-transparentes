@@ -329,7 +329,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 <script type="text/babel" data-presets="react">
 const { useState, useRef } = React;
 
-const APP_VERSION="v11";
+const APP_VERSION="v12";
 
 const W = {
   pageBg:"#F5F0E8",sidebarBg:"#EAE3D6",sidebarAct:"#DDD4C2",
@@ -540,7 +540,11 @@ const mkS=n=>({
   grainSize:"—",sorting:"—",roundness:"—",matrixPct:"",cementType:"",porosityPct:"",qfl:{q:"",f:"",l:""},
   protolith:"",metamorphicGrade:"—",facies:"—",
 });
-const mkMin=()=>{const m={id:Date.now()};["name","pct","habit","sz","cleavage","cPPL","relief","nRefr","pleo","cXPL","ramsay","ext","twins","v2","altMins","altType","obs"].forEach(k=>m[k]="");m.optChar="—";m.altDeg="—";return m;};
+// Date.now() solo no alcanza: varios minerales/anotaciones creados en el mismo tick
+// (ej. pcApply insertando 3 minerales de una) compartirían id y delMin borraría todos.
+let idSeq=0;
+const newId=()=>`${Date.now()}_${++idSeq}`;
+const mkMin=()=>{const m={id:newId()};["name","pct","habit","sz","cleavage","cPPL","relief","nRefr","pleo","cXPL","ramsay","ext","twins","v2","altMins","altType","obs"].forEach(k=>m[k]="");m.optChar="—";m.altDeg="—";return m;};
 
 // Resumen del conteo de puntos (usado en reporte, KMZ y SHP) — null si no hay puntos contados aún.
 const pointCountSummary=s=>{
@@ -563,7 +567,11 @@ const grainSizeSummary=s=>{
   const n=diams.length;
   const mean=diams.reduce((a,b)=>a+b,0)/n;
   const median=n%2?diams[(n-1)/2]:(diams[n/2-1]+diams[n/2])/2;
-  return{n,mean,median,min:diams[0],max:diams[n-1],unit:s.grainSizes[0].unit};
+  const unit=s.grainSizes[0].unit;
+  // Si el usuario recalibró en otra unidad a mitad de camino, los estadísticos mezclan escalas:
+  // el panel ya avisa en pantalla, y este flag lleva esa misma advertencia al reporte y al export.
+  const mixed=s.grainSizes.some(g=>g.unit!==unit);
+  return{n,mean,median,min:diams[0],max:diams[n-1],unit,mixed};
 };
 
 // 1568px = techo útil de visión de Claude/Gemini (más allá de eso lo re-escalan solos, pagando tokens de más)
@@ -638,8 +646,9 @@ const loadSamModel=async()=>{
   }
   return SAM;
 };
+const samImgKey=(view,img)=>`${view}:${img.url.length}:${img.w}x${img.h}`;
 const encodeSamImage=async(view,img)=>{
-  const key=`${view}:${img.url.length}:${img.w}x${img.h}`;
+  const key=samImgKey(view,img);
   if(SAM_IMG&&SAM_IMG.key===key)return SAM_IMG;
   const{RawImage}=SAM.mod;
   const raw=await RawImage.fromURL(img.url);
@@ -650,8 +659,11 @@ const encodeSamImage=async(view,img)=>{
 };
 // Devuelve {maskUrl,areaPx,score} — maskUrl es un PNG (data URL) del tamaño de la imagen, con la máscara pintada semitransparente.
 // Forma de tensores e indexado de máscara verificados contra el demo oficial (huggingface.co/spaces/Xenova/segment-anything-webgpu).
-const runSamDecode=async(x,y,img)=>{
+const runSamDecode=async(x,y,view,img)=>{
   const{Tensor,RawImage}=SAM.mod;
+  // SAM_IMG es cache global de módulo pero "armed" vive por muestra: si el usuario armó otra
+  // muestra en el medio, el cache ya no corresponde a esta imagen. Re-encodear antes de decodificar.
+  if(!SAM_IMG||SAM_IMG.key!==samImgKey(view,img))await encodeSamImage(view,img);
   const{processed,embeddings}=SAM_IMG;
   const reshaped=processed.reshaped_input_sizes[0]; // [h,w] del tensor de entrada
   const input_points=new Tensor("float32",[x*reshaped[1],y*reshaped[0]],[1,1,1,2]);
@@ -1252,7 +1264,8 @@ function App(){
   const upd=p=>setSamples(prev=>prev.map(x=>x.id===aid?{...x,...p}:x));
   // Snapshot antes de una acción destructiva (borrar imagen/mineral/anotación, reiniciar conteo, etc.)
   // — no en cada upd(), solo antes de las acciones que de verdad pierden trabajo.
-  const pushUndo=(label,sid)=>setUndoStack(prev=>[...prev,{sampleId:sid??aid,snapshot:sid?samples.find(x=>x.id===sid):s,label}].slice(-10));
+  // Se guarda también el índice para poder reinsertar una muestra eliminada en su lugar original.
+  const pushUndo=(label,sid)=>setUndoStack(prev=>[...prev,{sampleId:sid??aid,snapshot:sid?samples.find(x=>x.id===sid):s,index:samples.findIndex(x=>x.id===(sid??aid)),label}].slice(-10));
   const topUndo=undoStack[undoStack.length-1];
   // Además del caso normal (deshacer algo de la muestra activa), si la muestra del undo fue
   // eliminada por completo, ofrecemos deshacer igual sin importar cuál esté activa ahora.
@@ -1260,13 +1273,23 @@ function App(){
   const undoLast=()=>{
     if(!canUndo)return;
     const entry=topUndo;
-    setSamples(prev=>prev.some(x=>x.id===entry.sampleId)?prev.map(x=>x.id===entry.sampleId?entry.snapshot:x):[...prev,entry.snapshot]);
+    setSamples(prev=>{
+      if(prev.some(x=>x.id===entry.sampleId))return prev.map(x=>x.id===entry.sampleId?entry.snapshot:x);
+      const out=[...prev];out.splice(entry.index>=0?Math.min(entry.index,out.length):out.length,0,entry.snapshot);return out;
+    });
     setAid(entry.sampleId);
     setUndoStack(prev=>prev.slice(0,-1));
   };
   const updM=(k,v)=>upd({meta:{...s.meta,[k]:v}});
 
-  const loadImg=(type,file)=>{resizeImage(file).then(v=>upd({[type]:v})).catch(err=>alert("No se pudo procesar la imagen: "+err.message));};
+  // Al REEMPLAZAR una imagen, todo lo que estaba anclado a la anterior (calibración px→unidad,
+  // anotaciones, conteo de puntos) deja de corresponder: se limpia igual que al quitarla, con
+  // undo disponible. En la primera carga no hay nada que limpiar.
+  const loadImg=(type,file)=>{resizeImage(file).then(v=>{
+    if(!s[type]){upd({[type]:v});return;}
+    pushUndo(type==="ppl"?"Cambiar imagen PPL":"Cambiar imagen XPL");
+    upd({[type]:v,pointCount:s.pointCount.view===type?{...s.pointCount,active:false,points:[],cursor:-1,editIdx:null}:s.pointCount,spots:s.spots.filter(sp=>sp.view!==type),calib:s.calib?.view===type?null:s.calib,sam:s.sam.view===type?{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}:s.sam});
+  }).catch(err=>alert("No se pudo procesar la imagen: "+err.message));};
   const addMin=()=>upd({minerals:[...s.minerals,mkMin()]});
   const updMin=(id,k,v)=>upd({minerals:s.minerals.map(m=>m.id===id?{...m,[k]:v}:m)});
   const delMin=id=>{pushUndo("Eliminar mineral");upd({minerals:s.minerals.filter(m=>m.id!==id)});};
@@ -1282,28 +1305,29 @@ function App(){
   };
   const pcOpenEdit=idx=>updPC({editIdx:idx,cursor:idx});
   const pcCancelEdit=()=>updPC({editIdx:null});
-  const pcAssign=(idx,name)=>{
-    const points=s.pointCount.points.map((p,i)=>i===idx?{...p,mineral:name.trim()}:p);
+  // Derivado del estado previo dentro del updater, NO del "s" cerrado en el render: contar con
+  // atajos de teclado dispara asignaciones más rápido de lo que React re-renderiza, y un payload
+  // calculado desde el snapshot viejo pisaría la asignación anterior.
+  const pcAssignAt=(idx,name,openNext)=>setSamples(prev=>prev.map(x=>{
+    if(x.id!==aid)return x;
+    const points=x.pointCount.points.map((p,i)=>i===idx?{...p,mineral:name.trim()}:p);
     let next=null;
     for(let k=1;k<=points.length;k++){const j=(idx+k)%points.length;if(!points[j].mineral){next=j;break;}}
-    updPC({points,editIdx:next,cursor:next!=null?next:idx});
-  };
+    return{...x,pointCount:{...x.pointCount,points,cursor:next!=null?next:idx,editIdx:openNext?next:null}};
+  }));
+  const pcAssign=(idx,name)=>pcAssignAt(idx,name,true);
   // Como pcAssign, pero sin abrir el popup en el siguiente punto — para atajos de teclado,
   // donde querés seguir tipeando letras sin que el popup de texto libre se interponga.
-  const pcAssignQuick=(idx,name)=>{
-    const points=s.pointCount.points.map((p,i)=>i===idx?{...p,mineral:name.trim()}:p);
-    let next=null;
-    for(let k=1;k<=points.length;k++){const j=(idx+k)%points.length;if(!points[j].mineral){next=j;break;}}
-    updPC({points,cursor:next!=null?next:idx});
-  };
-  const pcMove=(dx,dy)=>{
-    const{cols,rows,points,cursor}=s.pointCount;
-    if(cursor<0||!points.length)return;
+  const pcAssignQuick=(idx,name)=>pcAssignAt(idx,name,false);
+  const pcMove=(dx,dy)=>setSamples(prev=>prev.map(x=>{
+    if(x.id!==aid)return x;
+    const{cols,rows,points,cursor}=x.pointCount;
+    if(cursor<0||!points.length)return x;
     const row=Math.min(rows-1,Math.max(0,points[cursor].row+dy));
     const col=Math.min(cols-1,Math.max(0,points[cursor].col+dx));
     const found=points.findIndex(p=>p.row===row&&p.col===col);
-    if(found>=0)updPC({cursor:found});
-  };
+    return found>=0?{...x,pointCount:{...x.pointCount,cursor:found}}:x;
+  }));
   const pcApply=()=>{
     const counted=s.pointCount.points.filter(p=>p.mineral);
     if(!counted.length)return;
@@ -1336,7 +1360,7 @@ function App(){
   const spotImgClick=(x,y)=>{
     const view=s.spotsView||(s.xpl?"xpl":"ppl");
     if(s.spotMode==="point"){
-      const sp={id:Date.now(),view,geom:"point",pts:[{x,y}],label:"",type:"",note:"",mineralId:"",photos:[]};
+      const sp={id:newId(),view,geom:"point",pts:[{x,y}],label:"",type:"",note:"",mineralId:"",photos:[]};
       upd({spots:[...s.spots,sp],spotEditId:sp.id});
       return;
     }
@@ -1349,7 +1373,7 @@ function App(){
     if(!d)return;
     const min=d.geom==="line"?2:3;
     if(d.pts.length<min)return;
-    const sp={id:Date.now(),view:d.view,geom:d.geom,pts:d.pts,label:"",type:"",note:"",mineralId:"",photos:[]};
+    const sp={id:newId(),view:d.view,geom:d.geom,pts:d.pts,label:"",type:"",note:"",mineralId:"",photos:[]};
     upd({spots:[...s.spots,sp],spotEditId:sp.id,spotDraft:null});
   };
   const cancelSpotDraft=()=>upd({spotDraft:null});
@@ -1408,7 +1432,7 @@ function App(){
   const samImgClick=async(x,y)=>{
     updSam({busy:true,busyMsg:"Analizando…",result:null});
     try{
-      const result=await runSamDecode(x,y,s.sam.view==="xpl"?s.xpl:s.ppl);
+      const result=await runSamDecode(x,y,s.sam.view,s.sam.view==="xpl"?s.xpl:s.ppl);
       updSam({busy:false,result:{x,y,...result}});
     }catch(e){
       updSam({busy:false,error:"No se pudo analizar ese punto. "+(e?.message||"")});
@@ -1418,7 +1442,7 @@ function App(){
     const r=s.sam.result;
     if(!r)return;
     const areaTxt=`Área detectada por IA (SlimSAM): ~${r.areaPx.toLocaleString()} px²`+((s.calib&&s.calib.view===s.sam.view)?` (~${(r.areaPx/(s.calib.pxPerUnit*s.calib.pxPerUnit)).toFixed(1)} ${s.calib.unit}²)`:"");
-    const sp={id:Date.now(),view:s.sam.view,x:r.x,y:r.y,label:"",type:"",note:areaTxt,mineralId:"",photos:[]};
+    const sp={id:newId(),view:s.sam.view,geom:"point",pts:[{x:r.x,y:r.y}],label:"",type:"",note:areaTxt,mineralId:"",photos:[]};
     upd({spots:[...s.spots,sp],spotEditId:sp.id,sam:{...s.sam,result:null}});
   };
   const samDismiss=()=>upd({sam:{view:null,armed:false,busy:false,busyMsg:"",error:null,result:null}});
@@ -1426,7 +1450,7 @@ function App(){
     const r=s.sam.result;
     if(!r||!s.calib||s.calib.view!==s.sam.view)return;
     const diamPx=2*Math.sqrt(r.areaPx/Math.PI);
-    const g={id:Date.now(),diam:diamPx/s.calib.pxPerUnit,unit:s.calib.unit};
+    const g={id:newId(),diam:diamPx/s.calib.pxPerUnit,unit:s.calib.unit};
     upd({grainSizes:[...s.grainSizes,g],sam:{...s.sam,result:null}});
   };
   const removeGrain=id=>upd({grainSizes:s.grainSizes.filter(g=>g.id!==id)});
@@ -1535,7 +1559,7 @@ ${AI_ROCK_SCHEMA}`}];
       protolith:keep(s.protolith,p.protolith),metamorphicGrade:keep(s.metamorphicGrade,p.metamorphicGrade),facies:keep(s.facies,p.facies),
     };
     if(Array.isArray(p.minerals)&&p.minerals.length&&(overwrite||s.minerals.length===0)){
-      patch.minerals=p.minerals.map(pm=>({...mkMin(),...pm,id:Date.now()+Math.random()}));
+      patch.minerals=p.minerals.map(pm=>({...mkMin(),...pm,id:newId()}));
     }
     upd(patch);
   };
@@ -1559,7 +1583,7 @@ ${AI_ROCK_SCHEMA}`}];
             return `<p><b>${sp.label||"(sin etiqueta)"}</b>${sp.type?` [${sp.type}]`:""} — ${sp.view==="xpl"?"XPL":"PPL"} (${geomLabel(sp.geom)})${sp.measure?`<br/>${sp.measure}`:""}${sp.mineralName?`<br/>Mineral: ${sp.mineralName}`:""}${sp.note?`<br/>Nota: ${sp.note}`:""}${photos?`<br/>${photos}`:""}</p>`;
           }).join("")}`:"";
           const gss=grainSizeSummary(sx);
-          const body=`${ph}<h3>${sx.name}</h3>${sx.meta.fm?`<p><b>Formación:</b> ${sx.meta.fm}</p>`:""}${sx.meta.loc?`<p><b>Localidad:</b> ${sx.meta.loc}</p>`:""}${sx.meta.este?`<p><b>UTM WGS84:</b> ${sx.meta.este}E / ${sx.meta.norte}N / Zona ${sx.meta.zona}</p>`:""}${sx.calib?`<p><b>Escala calibrada:</b> ${sx.calib.pxPerUnit.toFixed(2)} px/${sx.calib.unit} (${sx.calib.view==="xpl"?"XPL":"PPL"})</p>`:""}${sx.rockName?`<p><b>Nombre petrográfico:</b> ${sx.rockName}</p>`:""}${sx.texture?`<p><b>Textura:</b> ${sx.texture}</p>`:""}${pcs?`<p><b>Análisis modal (conteo de puntos):</b> grilla ${pcs.cols}×${pcs.rows}, ${pcs.total}/${pcs.ofTotal} puntos — ${pcs.pctStr}</p>`:""}${gss?`<p><b>Tamaño de grano (n=${gss.n}):</b> media ${gss.mean.toFixed(1)} ${gss.unit}, mediana ${gss.median.toFixed(1)} ${gss.unit}, rango ${gss.min.toFixed(1)}–${gss.max.toFixed(1)} ${gss.unit}</p>`:""}${sx.ai?`<p><b>Descripción IA:</b> ${sx.ai}</p>`:""}${sx.desc?`<p><b>Descripción:</b> ${sx.desc}</p>`:""}${spotsHtml}`;
+          const body=`${ph}<h3>${sx.name}</h3>${sx.meta.fm?`<p><b>Formación:</b> ${sx.meta.fm}</p>`:""}${sx.meta.loc?`<p><b>Localidad:</b> ${sx.meta.loc}</p>`:""}${sx.meta.este?`<p><b>UTM WGS84:</b> ${sx.meta.este}E / ${sx.meta.norte}N / Zona ${sx.meta.zona}</p>`:""}${sx.calib?`<p><b>Escala calibrada:</b> ${sx.calib.pxPerUnit.toFixed(2)} px/${sx.calib.unit} (${sx.calib.view==="xpl"?"XPL":"PPL"})</p>`:""}${sx.rockName?`<p><b>Nombre petrográfico:</b> ${sx.rockName}</p>`:""}${sx.texture?`<p><b>Textura:</b> ${sx.texture}</p>`:""}${pcs?`<p><b>Análisis modal (conteo de puntos):</b> grilla ${pcs.cols}×${pcs.rows}, ${pcs.total}/${pcs.ofTotal} puntos — ${pcs.pctStr}</p>`:""}${gss?`<p><b>Tamaño de grano (n=${gss.n}):</b> media ${gss.mean.toFixed(1)} ${gss.unit}, mediana ${gss.median.toFixed(1)} ${gss.unit}, rango ${gss.min.toFixed(1)}–${gss.max.toFixed(1)} ${gss.unit}${gss.mixed?" <b>⚠ mezcla unidades distintas</b>":""}</p>`:""}${sx.ai?`<p><b>Descripción IA:</b> ${sx.ai}</p>`:""}${sx.desc?`<p><b>Descripción:</b> ${sx.desc}</p>`:""}${spotsHtml}`;
           return `<Placemark><name>${sx.name}</name><description><![CDATA[${body}]]></description><Point><coordinates>${sx.lon},${sx.lat},0</coordinates></Point></Placemark>`;
         }).join("\n");
         zip.file("doc.kml",`<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>Cortes transparentes</name>\n${marks}\n</Document></kml>`);
@@ -1582,7 +1606,7 @@ ${AI_ROCK_SCHEMA}`}];
             Escala:sx.calib?`${sx.calib.pxPerUnit.toFixed(2)} px/${sx.calib.unit} (${sx.calib.view==="xpl"?"XPL":"PPL"})`:"",
             ConteoPts:pcs?`${pcs.total}/${pcs.ofTotal} pts, grilla ${pcs.cols}x${pcs.rows}: ${pcs.pctStr}`:"",
             Anotac:sps.map(sp=>`${sp.label||"(sin etiqueta)"}${sp.type?` [${sp.type}]`:""}`).join("; "),
-            TamGrano:gss?`n=${gss.n}, media ${gss.mean.toFixed(1)} ${gss.unit}, mediana ${gss.median.toFixed(1)}`:"",
+            TamGrano:gss?`n=${gss.n}, media ${gss.mean.toFixed(1)} ${gss.unit}, mediana ${gss.median.toFixed(1)}${gss.mixed?" (MEZCLA UNIDADES)":""}`:"",
             Descripcion:sx.desc||sx.ai||""};
         });
         const dbf=bldDBF(recs,fd);
@@ -1623,7 +1647,7 @@ ${AI_ROCK_SCHEMA}`}];
     const sps=spotSummaries(s);
     if(sps.length){L.push("ANOTACIONES:","-".repeat(38));sps.forEach(sp=>{L.push(`\n• ${sp.label||"(sin etiqueta)"}${sp.type?` [${sp.type}]`:""} — ${sp.view==="xpl"?"XPL":"PPL"} (${geomLabel(sp.geom)})`);if(sp.measure)L.push(`  Medida: ${sp.measure}`);if(sp.mineralName)L.push(`  Mineral vinculado: ${sp.mineralName}`);if(sp.note)L.push(`  Nota: ${sp.note}`);if(sp.photos.length)L.push(`  ${sp.photos.length} foto(s) de detalle (${sp.photos.map(p=>p.mag).filter(x=>x!=="—").join(", ")||"aumento no especificado"})`);});L.push("");}
     const gss=grainSizeSummary(s);
-    if(gss)L.push("TAMAÑO DE GRANO (diámetro equivalente, n="+gss.n+"):","-".repeat(38),`Media: ${gss.mean.toFixed(1)} ${gss.unit} · Mediana: ${gss.median.toFixed(1)} ${gss.unit} · Rango: ${gss.min.toFixed(1)}–${gss.max.toFixed(1)} ${gss.unit}`,"");
+    if(gss)L.push("TAMAÑO DE GRANO (diámetro equivalente, n="+gss.n+"):","-".repeat(38),`Media: ${gss.mean.toFixed(1)} ${gss.unit} · Mediana: ${gss.median.toFixed(1)} ${gss.unit} · Rango: ${gss.min.toFixed(1)}–${gss.max.toFixed(1)} ${gss.unit}`,...(gss.mixed?["⚠ ATENCIÓN: la lista mezcla medidas tomadas en distintas unidades; los estadísticos no son comparables."]:[]),"");
     if(s.desc)L.push("\nDESCRIPCIÓN:",s.desc);
     return L.join("\n");
   };
