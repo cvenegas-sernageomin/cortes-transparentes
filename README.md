@@ -1,5 +1,7 @@
 # Cortes Transparentes · Petrografía (PWA)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23196784.svg)](https://doi.org/10.5281/zenodo.23196784)
+
 Editor petrográfico de cortes transparentes (secciones delgadas): imágenes PPL/XPL,
 minerales con propiedades ópticas, alteración, metadatos con coordenadas UTM,
 descripción asistida por IA, reporte de texto y exportación a **KMZ** y **Shapefile**.
@@ -36,4 +38,4 @@ Las librerías de terceros incluidas (por ejemplo en `vendor/`) conservan sus pr
 
 Cita sugerida:
 
-> SERNAGEOMIN / Venegas Benavides, C. (2026). Cortes Transparentes: editor petrográfico [aplicación web]. https://cvenegas-sernageomin.github.io/cortes-transparentes/
+> SERNAGEOMIN / Venegas Benavides, C. (2026). Cortes Transparentes: editor petrográfico [aplicación web]. https://cvenegas-sernageomin.github.io/cortes-transparentes/ · DOI: https://doi.org/10.5281/zenodo.23196784
