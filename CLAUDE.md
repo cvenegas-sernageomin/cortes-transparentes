@@ -11,5 +11,11 @@ Ficha en memoria: `proyecto-cortes-transparentes` (y skill de petrografía en `_
 - Si dos subagentes tocan el mismo componente, van en secuencia, no en paralelo.
 - Commit + push solo con confirmación del usuario.
 
+## Ramas y publicación
+Un solo repo en GitHub con dos ramas: **`fuente`** (código; aquí es `master` siguiendo `origin/fuente`) y **`main`**
+(contenido de `pwa/`, publicado en Pages). En el PC de origen `pwa/` era un clon propio de `main`; **en este PC no**
+(se perdió en el rescate y `pwa/` quedó versionada dentro de `fuente`). Para publicar desde aquí:
+`git worktree add ../cortes-main main`, copiar `pwa/*` encima, commit y push desde ese worktree.
+
 ## Verificar
 `serve.ps1` sirve local. Verificar con casos reales (ej. eliminar+deshacer una muestra completa), no solo el caso fácil.
